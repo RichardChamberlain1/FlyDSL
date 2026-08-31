@@ -56,6 +56,12 @@ except ImportError:
 GFX950_WAVE_SIZE = 64
 GFX950_DMA_BYTES = 16
 
+# s_waitcnt bitfield encoding for gfx942/gfx950 (CDNA3/4):
+# vmcnt: bits [3:0] and [15:14], lgkmcnt: bits [11:8], expcnt: bits [6:4]
+_WAIT_VMCNT_0 = 0x0F70    # vmcnt=0, lgkmcnt=15, expcnt=7
+_WAIT_LGKMCNT_0 = 0xC07F  # vmcnt=63, lgkmcnt=0, expcnt=7
+_WAIT_ALL = 0              # vmcnt=0, lgkmcnt=0, expcnt=0
+
 FLEX_DTYPE_BF16 = 2
 FLEX_DTYPE_FP16 = 3
 
@@ -409,15 +415,12 @@ def flex_attn_16x16_kernel(
     _v_step_elems = _v_subtile_elems // 4
     _lds_ring_slots = 2
 
-    _p_elems = num_groups * block_m * block_n
-
     @fx.struct
     class SharedStorage:
         k_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
         k_lds_1: fx.Array[elem_dtype, kv_tile_elems, 16]
         v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
         v_lds_1: fx.Array[elem_dtype, kv_tile_elems, 16]
-        p_lds: fx.Array[elem_dtype, _p_elems, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     sK_ptr = [storage.k_lds_0.peek().ptr, storage.k_lds_1.peek().ptr]
@@ -552,19 +555,21 @@ def flex_attn_16x16_kernel(
 
     _k_iters = _n_k_steps
 
-    # ── V LDS read: scalar reads (correct baseline for 64 threads) ──────────
+    # ── V LDS read: scalar reads for 64 threads ──────────────────────────
     # 32x32 MFMA A (V) layout: Row(D) = t0_32, Col(score) = t1_32*8 + v
     # v_lo: scores 0-15, v_hi: scores 16-31
     # V LDS step format: step = dc*4 + score_row//8, within step: row*32 + d_col
+    _t0_32_v = local_tid % 32
+    _t1_32_v = local_tid // 32
 
     def _make_read_v(slot):
         _slot_v_ptr = sV_ptr[slot]
         def _read():
             v_lo_out = [None] * _n_d_chunks
             v_hi_out = [None] * _n_d_chunks
-            d_row = _t0_32
-            score_base_lo = _t1_32 * 8
-            score_base_hi = 16 + _t1_32 * 8
+            d_row = _t0_32_v
+            score_base_lo = _t1_32_v * 8
+            score_base_hi = 16 + _t1_32_v * 8
             for dc in range_constexpr(_n_d_chunks):
                 lo_elems = [None] * 8
                 hi_elems = [None] * 8
@@ -926,48 +931,6 @@ def flex_attn_16x16_kernel(
             o_accs[dc] = _mfma_acc(v_lo_regs[dc], p_b_lo, o_accs[dc], _pv_mma_atom_32)
             o_accs[dc] = _mfma_acc(v_hi_regs[dc], p_b_hi, o_accs[dc], _pv_mma_atom_32)
 
-    # ── PV GEMM via LDS P bridge ──────────────────────────────────────────
-    _p_lds_layout = fx.make_layout((block_n, block_m), (block_m, 1))
-    sP_ptr = storage.p_lds.peek().ptr + group * fx.Int32(block_m * block_n)
-    _pv_query = _t0_32
-
-    def pv_gemm_lds_bridge(p_lo_vals, p_hi_vals, v_lo_regs, v_hi_regs, o_accs):
-        """PV GEMM with LDS P bridge (faster than register path for 1-wave groups)."""
-        for v0 in range_constexpr(4):
-            score_lo = _t1 * 4 + v0
-            score_hi = 16 + _t1 * 4 + v0
-            p_lo_bf = _to_elem(p_lo_vals[v0], elem_dtype)
-            p_hi_bf = _to_elem(p_hi_vals[v0], elem_dtype)
-            p_lo_hi_bf = _to_elem(p_lo_vals[4 + v0], elem_dtype)
-            p_hi_hi_bf = _to_elem(p_hi_vals[4 + v0], elem_dtype)
-            idx = fx.get_scalar(fx.crd2idx(fx.make_int_tuple((score_lo, _t0)), _p_lds_layout))
-            fx.ptr_store(p_lo_bf, fx.add_offset(sP_ptr, fx.make_int_tuple(idx)))
-            idx = fx.get_scalar(fx.crd2idx(fx.make_int_tuple((score_lo, 16 + _t0)), _p_lds_layout))
-            fx.ptr_store(p_hi_bf, fx.add_offset(sP_ptr, fx.make_int_tuple(idx)))
-            idx = fx.get_scalar(fx.crd2idx(fx.make_int_tuple((score_hi, _t0)), _p_lds_layout))
-            fx.ptr_store(p_lo_hi_bf, fx.add_offset(sP_ptr, fx.make_int_tuple(idx)))
-            idx = fx.get_scalar(fx.crd2idx(fx.make_int_tuple((score_hi, 16 + _t0)), _p_lds_layout))
-            fx.ptr_store(p_hi_hi_bf, fx.add_offset(sP_ptr, fx.make_int_tuple(idx)))
-        rocdl.s_waitcnt(0)
-        rocdl.s_barrier()
-        p_lo_f32 = []
-        for v in range_constexpr(8):
-            score_idx = _t1_32 * 8 + v
-            idx = fx.get_scalar(fx.crd2idx(fx.make_int_tuple((score_idx, _pv_query)), _p_lds_layout))
-            val = fx.ptr_load(fx.add_offset(sP_ptr, fx.make_int_tuple(idx)))
-            p_lo_f32.append(fx.Float32(_to_elem(val, fx.Float32)))
-        p_hi_f32 = []
-        for v in range_constexpr(8):
-            score_idx = 16 + _t1_32 * 8 + v
-            idx = fx.get_scalar(fx.crd2idx(fx.make_int_tuple((score_idx, _pv_query)), _p_lds_layout))
-            val = fx.ptr_load(fx.add_offset(sP_ptr, fx.make_int_tuple(idx)))
-            p_hi_f32.append(fx.Float32(_to_elem(val, fx.Float32)))
-        p_b_lo = _pack_8_f32_to_v8elem(p_lo_f32)
-        p_b_hi = _pack_8_f32_to_v8elem(p_hi_f32)
-        for dc in range_constexpr(_n_d_chunks):
-            o_accs[dc] = _mfma_acc(v_lo_regs[dc], p_b_lo, o_accs[dc], _pv_mma_atom_32)
-            o_accs[dc] = _mfma_acc(v_hi_regs[dc], p_b_hi, o_accs[dc], _pv_mma_atom_32)
-
     # ── Cluster sync ──────────────────────────────────────────────────────
     def dualwave_cluster_sync(cluster_index):
         rocdl.sched_barrier(0)
@@ -1008,89 +971,223 @@ def flex_attn_16x16_kernel(
         clamped = fx.Int32(arith.minsi(fx.Int32(tile_idx).ir_value(), _kv_last.ir_value()))
         load_kv(clamped, slot)
 
-    def _do_tile(kv_i32, m_i, l_i, o_accs, read_slot, dma_slot, has_next, valid=None):
-        """One KV tile iteration."""
-        rocdl.s_waitcnt(0)
-        rocdl.s_barrier()
-        read_k_work(read_slot)
-        rocdl.sched_barrier(0)
-        if has_next:
-            _safe_load_kv(kv_i32 + fx.Int32(1), dma_slot)
-        v_lo_regs, v_hi_regs = read_v_slot[read_slot]()
-        rocdl.s_waitcnt(0)
-        dualwave_cluster_sync(0)
+    def _mask_scores(c00, c01, c10, c11, valid):
+        """Apply valid mask to scores (replaces invalid with -inf)."""
+        _neg_inf = fx.Float32(-1e9)
+        c00_v, c01_v = fx.Vector(c00), fx.Vector(c01)
+        c10_v, c11_v = fx.Vector(c10), fx.Vector(c11)
+        c00 = fx.Vector.from_elements([valid.select(c00_v[i], _neg_inf) for i in range_constexpr(4)], fx.Float32).ir_value()
+        c01 = fx.Vector.from_elements([valid.select(c01_v[i], _neg_inf) for i in range_constexpr(4)], fx.Float32).ir_value()
+        c10 = fx.Vector.from_elements([valid.select(c10_v[i], _neg_inf) for i in range_constexpr(4)], fx.Float32).ir_value()
+        c11 = fx.Vector.from_elements([valid.select(c11_v[i], _neg_inf) for i in range_constexpr(4)], fx.Float32).ir_value()
+        return c00, c01, c10, c11
 
-        # QK GEMM: 4x 16x16x16 (K from LDS)
-        c00, c01, c10, c11 = gemm1_qk_16x16(read_slot)
-
-        # Apply mods
+    def _qk_softmax_start(slot, kv_i32, m_i):
+        """QK GEMM + mods + softmax_start. Returns (corr, s_lo, s_hi, m_new)."""
+        c00, c01, c10, c11 = gemm1_qk_16x16(slot)
         if const_expr(mod_has_score or mod_has_mask):
             c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32)
+        corr, s_lo, s_hi, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
+        return corr, s_lo, s_hi, m_new
 
-        if valid is not None:
-            _neg_inf = fx.Float32(-1e9)
-            c00_v = fx.Vector(c00)
-            c01_v = fx.Vector(c01)
-            c10_v = fx.Vector(c10)
-            c11_v = fx.Vector(c11)
-            c00_elems = [valid.select(c00_v[i], _neg_inf) for i in range_constexpr(4)]
-            c01_elems = [valid.select(c01_v[i], _neg_inf) for i in range_constexpr(4)]
-            c10_elems = [valid.select(c10_v[i], _neg_inf) for i in range_constexpr(4)]
-            c11_elems = [valid.select(c11_v[i], _neg_inf) for i in range_constexpr(4)]
-            c00 = fx.Vector.from_elements(c00_elems, fx.Float32).ir_value()
-            c01 = fx.Vector.from_elements(c01_elems, fx.Float32).ir_value()
-            c10 = fx.Vector.from_elements(c10_elems, fx.Float32).ir_value()
-            c11 = fx.Vector.from_elements(c11_elems, fx.Float32).ir_value()
+    def _qk_softmax_start_masked(slot, kv_i32, m_i, valid):
+        """QK GEMM + mods + valid mask + softmax_start."""
+        c00, c01, c10, c11 = gemm1_qk_16x16(slot)
+        if const_expr(mod_has_score or mod_has_mask):
+            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32)
+        c00, c01, c10, c11 = _mask_scores(c00, c01, c10, c11, valid)
+        corr, s_lo, s_hi, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
+        return corr, s_lo, s_hi, m_new
 
-        # Softmax
-        corr_scalar, s_lo, s_hi, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
+    def _finish_pv(s_lo, s_hi, m_i, l_i, o_accs, corr, v_lo, v_hi):
+        """softmax_finish + register PV GEMM. Returns (l_i, o_accs)."""
+        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(s_lo, s_hi, m_i[0], l_i, o_accs, corr)
+        pv_gemm_register(p_lo, p_hi, v_lo, v_hi, o_accs)
+        return l_i, o_accs
+
+    # ── Overlapping softmax pipeline (4-cluster) ──────────────────────────
+
+    def _do_tile_prologue(kv_i32, m_i, l_i, o_accs):
+        """First pair: no deferred PV from previous."""
+        odd_valid = (kv_i32 + fx.Int32(1)) < _kv_hi
+        has_next = (kv_i32 + fx.Int32(2)) < _kv_hi
+        # Cluster 0: mem tile 0
+        rocdl.s_waitcnt(_WAIT_VMCNT_0)
+        rocdl.s_barrier()
+        read_k_work(0)
+        v_lo_0, v_hi_0 = read_v_slot[0]()
+        if odd_valid:
+            _safe_load_kv(kv_i32 + fx.Int32(1), 1)
+        rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
+        dualwave_cluster_sync(0)
+        # Cluster 1: QK tile 0, no deferred PV
+        corr_0, s_lo_0, s_hi_0, m_new = _qk_softmax_start(0, kv_i32, m_i)
         m_i = [m_new]
-
-        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(
-            s_lo, s_hi, m_new, l_i, o_accs, corr_scalar)
-
-        # PV GEMM via LDS bridge
-        pv_gemm_lds_bridge(p_lo, p_hi, v_lo_regs, v_hi_regs, o_accs)
         dualwave_cluster_sync(1)
+        # Cluster 2: mem tile 1
+        rocdl.s_waitcnt(_WAIT_VMCNT_0)
+        rocdl.s_barrier()
+        read_k_work(1)
+        v_lo_1, v_hi_1 = read_v_slot[1]()
+        if has_next:
+            _safe_load_kv(kv_i32 + fx.Int32(2), 0)
+        rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
+        dualwave_cluster_sync(2)
+        # Cluster 3: QK tile 1 + PV from tile 0
+        l_i, o_accs = _finish_pv(s_lo_0, s_hi_0, m_i, l_i, o_accs, corr_0, v_lo_0, v_hi_0)
+        corr_1, s_lo_1, s_hi_1, m_new = _qk_softmax_start_masked(1, kv_i32 + fx.Int32(1), m_i, odd_valid)
+        m_i = [m_new]
+        dualwave_cluster_sync(3)
+        return (m_i, l_i, o_accs,
+                s_lo_1, s_hi_1, corr_1, v_lo_1, v_hi_1, m_i)
+
+    def _do_tile_main(kv_i32, m_i, l_i, o_accs,
+                      s_lo_prev, s_hi_prev, corr_prev, v_lo_prev, v_hi_prev, m_i_prev):
+        """Steady-state: has deferred PV, guaranteed valid odd + next."""
+        # Cluster 0: mem tile 0
+        rocdl.s_waitcnt(_WAIT_VMCNT_0)
+        read_k_work(0)
+        v_lo_0, v_hi_0 = read_v_slot[0]()
+        _safe_load_kv(kv_i32 + fx.Int32(1), 1)
+        rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
+        dualwave_cluster_sync(0)
+        # Cluster 1: QK tile 0 + deferred PV from prev
+        l_i, o_accs = _finish_pv(s_lo_prev, s_hi_prev, m_i_prev, l_i, o_accs, corr_prev, v_lo_prev, v_hi_prev)
+        corr_0, s_lo_0, s_hi_0, m_new = _qk_softmax_start(0, kv_i32, m_i)
+        m_i = [m_new]
+        dualwave_cluster_sync(1)
+        # Cluster 2: mem tile 1
+        rocdl.s_waitcnt(_WAIT_VMCNT_0)
+        read_k_work(1)
+        v_lo_1, v_hi_1 = read_v_slot[1]()
+        _safe_load_kv(kv_i32 + fx.Int32(2), 0)
+        rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
+        dualwave_cluster_sync(2)
+        # Cluster 3: QK tile 1 + PV from tile 0
+        l_i, o_accs = _finish_pv(s_lo_0, s_hi_0, m_i, l_i, o_accs, corr_0, v_lo_0, v_hi_0)
+        corr_1, s_lo_1, s_hi_1, m_new = _qk_softmax_start(1, kv_i32 + fx.Int32(1), m_i)
+        m_i = [m_new]
+        dualwave_cluster_sync(3)
+        return (m_i, l_i, o_accs,
+                s_lo_1, s_hi_1, corr_1, v_lo_1, v_hi_1, m_i)
+
+    def _do_tile_epilogue(kv_i32, m_i, l_i, o_accs,
+                          s_lo_prev, s_hi_prev, corr_prev, v_lo_prev, v_hi_prev, m_i_prev):
+        """Last pair: has deferred PV, odd may be invalid, no next DMA."""
+        odd_valid = (kv_i32 + fx.Int32(1)) < _kv_hi
+        has_next = (kv_i32 + fx.Int32(2)) < _kv_hi
+        # Cluster 0: mem tile 0
+        rocdl.s_waitcnt(_WAIT_VMCNT_0)
+        rocdl.s_barrier()
+        read_k_work(0)
+        v_lo_0, v_hi_0 = read_v_slot[0]()
+        if odd_valid:
+            _safe_load_kv(kv_i32 + fx.Int32(1), 1)
+        rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
+        dualwave_cluster_sync(0)
+        # Cluster 1: QK tile 0 + deferred PV from prev
+        l_i, o_accs = _finish_pv(s_lo_prev, s_hi_prev, m_i_prev, l_i, o_accs, corr_prev, v_lo_prev, v_hi_prev)
+        corr_0, s_lo_0, s_hi_0, m_new = _qk_softmax_start(0, kv_i32, m_i)
+        m_i = [m_new]
+        dualwave_cluster_sync(1)
+        # Cluster 2: mem tile 1
+        rocdl.s_waitcnt(_WAIT_VMCNT_0)
+        rocdl.s_barrier()
+        read_k_work(1)
+        v_lo_1, v_hi_1 = read_v_slot[1]()
+        if has_next:
+            _safe_load_kv(kv_i32 + fx.Int32(2), 0)
+        rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
+        dualwave_cluster_sync(2)
+        # Cluster 3: QK tile 1 + PV from tile 0 + final deferred
+        l_i, o_accs = _finish_pv(s_lo_0, s_hi_0, m_i, l_i, o_accs, corr_0, v_lo_0, v_hi_0)
+        corr_1, s_lo_1, s_hi_1, m_new = _qk_softmax_start_masked(1, kv_i32 + fx.Int32(1), m_i, odd_valid)
+        m_i = [m_new]
+        # Flush final deferred PV
+        l_i, o_accs = _finish_pv(s_lo_1, s_hi_1, m_i, l_i, o_accs, corr_1, v_lo_1, v_hi_1)
+        dualwave_cluster_sync(3)
         return m_i, l_i, o_accs
 
-    # ── Simple non-overlapping KV loop ────────────────────────────────────
+    # ── KV loop with overlapping softmax ──────────────────────────────────
     _kv_range = _kv_hi - _kv_lo
     _kv_pairs = (_kv_range + fx.Int32(1)) // fx.Int32(2)
     _o = 2 * npair
+    _n_s = 16  # 8 s_lo + 8 s_hi
+
+    # Prologue: first pair
+    (m_i, l_i, o_accs,
+     s_lo_prev, s_hi_prev, corr_prev, v_lo_prev, v_hi_prev, m_i_prev) = (
+        _do_tile_prologue(_kv_lo, m_i, l_i, o_accs)
+    )
+
+    # Main loop: pairs 1 .. _kv_pairs-2
+    _main_count = _kv_pairs - fx.Int32(2)
+    _sm_base = _o + _n_d_chunks
+    _v_base = _sm_base + _n_s + 1
+    _mi_prev_base = _v_base + 2 * _n_d_chunks
 
     init_args = (
         [m_i[r] for r in range_constexpr(npair)]
         + [l_i[r] for r in range_constexpr(npair)]
         + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+        + s_lo_prev + s_hi_prev + [corr_prev]
+        + [v_lo_prev[dc] for dc in range_constexpr(_n_d_chunks)]
+        + [v_hi_prev[dc] for dc in range_constexpr(_n_d_chunks)]
+        + [m_i_prev[r] for r in range_constexpr(npair)]
     )
     loop_results = init_args
-    for kv_pair, loop_args in range(
+
+    for kv_mid, loop_args in range(
         fx.Int32(0),
-        _kv_pairs,
+        _main_count,
         fx.Int32(1),
         init=init_args,
     ):
         m_i = [loop_args[r] for r in range_constexpr(npair)]
         l_i = [loop_args[npair + r] for r in range_constexpr(npair)]
         o_accs = [loop_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+        s_lo_prev = [loop_args[_sm_base + i] for i in range_constexpr(8)]
+        s_hi_prev = [loop_args[_sm_base + 8 + i] for i in range_constexpr(8)]
+        corr_prev = loop_args[_sm_base + _n_s]
+        v_lo_prev = [loop_args[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
+        v_hi_prev = [loop_args[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
+        m_i_prev = [loop_args[_mi_prev_base + r] for r in range_constexpr(npair)]
 
-        kv_even = _kv_lo + fx.Int32(arith.index_cast(T.i32, kv_pair)) * fx.Int32(2)
-        kv_odd = kv_even + fx.Int32(1)
-        has_next_even = (kv_even + fx.Int32(1)) < _kv_hi
-        has_next_odd = (kv_odd + fx.Int32(1)) < _kv_hi
-        odd_valid = kv_odd < _kv_hi
-        m_i, l_i, o_accs = _do_tile(kv_even, m_i, l_i, o_accs, 0, 1, has_next_even)
-        m_i, l_i, o_accs = _do_tile(kv_odd, m_i, l_i, o_accs, 1, 0,
-                                     has_next_odd, valid=odd_valid)
+        kv_even = _kv_lo + (fx.Int32(arith.index_cast(T.i32, kv_mid)) + fx.Int32(1)) * fx.Int32(2)
+        (m_i, l_i, o_accs,
+         s_lo_prev, s_hi_prev, corr_prev, v_lo_prev, v_hi_prev, m_i_prev) = (
+            _do_tile_main(
+                kv_even, m_i, l_i, o_accs,
+                s_lo_prev, s_hi_prev, corr_prev, v_lo_prev, v_hi_prev, m_i_prev,
+            )
+        )
+
         loop_results = yield (
             [m_i[r] for r in range_constexpr(npair)]
             + [l_i[r] for r in range_constexpr(npair)]
             + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+            + s_lo_prev + s_hi_prev + [corr_prev]
+            + [v_lo_prev[dc] for dc in range_constexpr(_n_d_chunks)]
+            + [v_hi_prev[dc] for dc in range_constexpr(_n_d_chunks)]
+            + [m_i_prev[r] for r in range_constexpr(npair)]
         )
+
     m_i = [loop_results[r] for r in range_constexpr(npair)]
     l_i = [loop_results[npair + r] for r in range_constexpr(npair)]
     o_accs = [loop_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+    s_lo_prev = [loop_results[_sm_base + i] for i in range_constexpr(8)]
+    s_hi_prev = [loop_results[_sm_base + 8 + i] for i in range_constexpr(8)]
+    corr_prev = loop_results[_sm_base + _n_s]
+    v_lo_prev = [loop_results[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
+    v_hi_prev = [loop_results[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
+    m_i_prev = [loop_results[_mi_prev_base + r] for r in range_constexpr(npair)]
+
+    # Epilogue: last pair, flush deferred PV
+    _kv_last_pair = _kv_lo + (_kv_pairs - fx.Int32(1)) * fx.Int32(2)
+    m_i, l_i, o_accs = _do_tile_epilogue(
+        _kv_last_pair, m_i, l_i, o_accs,
+        s_lo_prev, s_hi_prev, corr_prev, v_lo_prev, v_hi_prev, m_i_prev,
+    )
 
     if const_expr(_enable_stagger):
         _stagger_extra_barrier_if_zero(stagger_i32)
