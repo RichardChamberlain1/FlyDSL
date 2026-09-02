@@ -343,31 +343,46 @@ def _to_elem(val, elem_ty):
     return fx.Float32(val).to(elem_ty)
 
 
-def _shuffle_xor_f32(val_f32, lane_mask):
-    """Cross-lane f32 exchange via gpu.shuffle XOR."""
+def _permlane16_xor_f32(val_f32):
+    """Exchange f32 between lanes N and N^16 via VALU (no LDS contention).
+
+    Uses v_permlane16_swap_b32 (VALU pipeline) instead of ds_bpermute, which
+    contends with K/V LDS reads. Returns (own_value, partner_value).
+
+    permlane16_swap returns a fixed (low16_lane_value, high16_lane_value) pair
+    per 32-lane group, NOT a per-lane symmetric swap. The XOR-16 partner is the
+    high-16 slot for low-half lanes and the low-16 slot for high-half lanes, so
+    select the partner by lane position.
+    """
+    from flydsl._mlir import ir
     from flydsl._mlir.dialects import arith as _arith
+    from flydsl._mlir.dialects import llvm
     v_i32 = fx.Int32(_arith.bitcast(T.i32, fx.Float32(val_f32).ir_value()))
-    shuffled_ir = v_i32.shuffle_xor(lane_mask, GFX950_WAVE_SIZE)
-    if hasattr(shuffled_ir, "ir_value"):
-        shuffled_ir = shuffled_ir.ir_value()
-    return fx.Float32(_arith.bitcast(T.f32, shuffled_ir))
+    pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    swapped = rocdl.permlane16_swap(pair_ty, v_i32.ir_value(), v_i32.ir_value(), False, True)
+    slot_lo = fx.Float32(_arith.bitcast(T.f32, llvm.extractvalue(T.i32, swapped, [0])))
+    slot_hi = fx.Float32(_arith.bitcast(T.f32, llvm.extractvalue(T.i32, swapped, [1])))
+    _lane = fx.Int32(arith.index_cast(T.i32, fx.thread_idx.x))
+    _is_hi16 = fx.Int32(_lane % 32) >= fx.Int32(16)
+    partner = _is_hi16.select(slot_lo, slot_hi)
+    return fx.Float32(val_f32), partner
 
 
-def _reduce_16x16_max(val, lane_mask=16):
+def _reduce_16x16_max(val):
     """Reduce max across 4 k-groups of a 16x16 MFMA C fragment.
 
-    Step 1: shuffle_xor(16) combines groups 0↔1 and 2↔3.
+    Step 1: permlane16_swap XOR-16 combines groups 0↔1 and 2↔3.
     Step 2: permlane32_swap combines the two halves (0,1) ↔ (2,3).
     """
-    other = _shuffle_xor_f32(val, lane_mask)
+    _, other = _permlane16_xor_f32(val)
     val = fx.Float32(val).maximumf(other)
     val = _permlane32_reduce(val, "max")
     return val
 
 
-def _reduce_16x16_sum(val, lane_mask=16):
+def _reduce_16x16_sum(val):
     """Reduce sum across 4 k-groups of a 16x16 MFMA C fragment."""
-    other = _shuffle_xor_f32(val, lane_mask)
+    _, other = _permlane16_xor_f32(val)
     val = fx.Float32(val).addf(other, fastmath=_FM)
     val = _permlane32_reduce(val, "sum")
     return val
@@ -555,38 +570,72 @@ def flex_attn_16x16_kernel(
 
     _k_iters = _n_k_steps
 
-    # ── V LDS read: scalar reads for 64 threads ──────────────────────────
-    # 32x32 MFMA A (V) layout: Row(D) = t0_32, Col(score) = t1_32*8 + v
-    # v_lo: scores 0-15, v_hi: scores 16-31
-    # V LDS step format: step = dc*4 + score_row//8, within step: row*32 + d_col
-    _t0_32_v = local_tid % 32
-    _t1_32_v = local_tid // 32
+    # ── V LDS read: vectorized transpose reads for 64 threads ──────────
+    # Uses LDSReadTrans16_64b (ds_read_b64_tr_b16) for 4× fewer LDS ops.
+    #
+    # Each ds_read_tr16_b64 gives 4 bf16 (4 score values at one D position).
+    # We need 8 contiguous scores per v_lo/v_hi to match the P B operand from
+    # pv_gemm_register (which packs P in contiguous score order).
+    #
+    # Each V step holds 8 rows × 32 cols. K_group 0 (rows 0-3) covers the low
+    # 4 rows; K_group 1 (rows 4-7) covers the high 4 rows. To get all 8 rows
+    # from one step, each K_group does 2 reads: one at its native _v_row_off,
+    # one shifted by ±4 rows to reach the other half.
+    #
+    # v_lo (scores 0-15): K_group g reads from step dc*4+g, both row halves.
+    # v_hi (scores 16-31): K_group g reads from step dc*4+2+g, both row halves.
+    _v_tr_atom = fx.make_copy_atom(rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype)
+    _v_tr_layout = fx.make_layout(4, 1)
+    _v_row_off = ((local_tid % 16) // 4) + ((local_tid // 32) * 4)
+    _v_col_off = ((local_tid % 4) * 4) + (16 * ((local_tid % 32) // 16))
+    _v_lane_elem = fx.Int32(_v_row_off * 32 + (_v_col_off % 32))
+    _v_kgroup = local_tid // 32
+    # Offset to read from row 0 of any step (subtract K_group 1's 4-row bias).
+    _v_lane_base = _v_lane_elem - fx.Int32(_v_kgroup * 128)
+    # Per-K_group step offset (in elements): K_group g reads from step dc*4+g.
+    _v_kgroup_step = fx.Int32(_v_kgroup * _v_step_elems)
 
     def _make_read_v(slot):
         _slot_v_ptr = sV_ptr[slot]
         def _read():
+            base_ptr = fx.add_offset(_slot_v_ptr, fx.make_int_tuple(_v_lane_base))
             v_lo_out = [None] * _n_d_chunks
             v_hi_out = [None] * _n_d_chunks
-            d_row = _t0_32_v
-            score_base_lo = _t1_32_v * 8
-            score_base_hi = 16 + _t1_32_v * 8
             for dc in range_constexpr(_n_d_chunks):
-                lo_elems = [None] * 8
-                hi_elems = [None] * 8
-                for v in range_constexpr(8):
-                    score_lo = score_base_lo + v
-                    score_hi = score_base_hi + v
-                    d_col = d_row
-                    step_lo = dc * 4 + score_lo // 8
-                    row_lo = score_lo % 8
-                    off_lo = step_lo * _v_step_elems + row_lo * 32 + d_col
-                    lo_elems[v] = _to_elem(fx.ptr_load(fx.add_offset(_slot_v_ptr, fx.make_int_tuple(off_lo))), elem_dtype)
-                    step_hi = dc * 4 + score_hi // 8
-                    row_hi = score_hi % 8
-                    off_hi = step_hi * _v_step_elems + row_hi * 32 + d_col
-                    hi_elems[v] = _to_elem(fx.ptr_load(fx.add_offset(_slot_v_ptr, fx.make_int_tuple(off_hi))), elem_dtype)
-                v_lo_out[dc] = Vec.from_elements(lo_elems, elem_dtype).ir_value()
-                v_hi_out[dc] = Vec.from_elements(hi_elems, elem_dtype).ir_value()
+                lo_base = fx.Int32((dc * 4) * _v_step_elems) + _v_kgroup_step
+                hi_base = fx.Int32((dc * 4 + 2) * _v_step_elems) + _v_kgroup_step
+                # v_lo: read rows 0-3 then rows 4-7 from the lo step
+                src = fx.make_view(
+                    fx.add_offset(base_ptr, fx.make_int_tuple(lo_base)),
+                    _v_tr_layout,
+                )
+                dst = fx.make_rmem_tensor(_v_tr_layout, elem_dtype)
+                fx.copy(_v_tr_atom, src, dst)
+                half_lo_0 = Vec(dst.load())
+                src = fx.make_view(
+                    fx.add_offset(base_ptr, fx.make_int_tuple(lo_base + fx.Int32(128))),
+                    _v_tr_layout,
+                )
+                dst = fx.make_rmem_tensor(_v_tr_layout, elem_dtype)
+                fx.copy(_v_tr_atom, src, dst)
+                half_lo_1 = Vec(dst.load())
+                v_lo_out[dc] = half_lo_0.shuffle(half_lo_1, list(range(8))).ir_value()
+                # v_hi: read rows 0-3 then rows 4-7 from the hi step
+                src = fx.make_view(
+                    fx.add_offset(base_ptr, fx.make_int_tuple(hi_base)),
+                    _v_tr_layout,
+                )
+                dst = fx.make_rmem_tensor(_v_tr_layout, elem_dtype)
+                fx.copy(_v_tr_atom, src, dst)
+                half_hi_0 = Vec(dst.load())
+                src = fx.make_view(
+                    fx.add_offset(base_ptr, fx.make_int_tuple(hi_base + fx.Int32(128))),
+                    _v_tr_layout,
+                )
+                dst = fx.make_rmem_tensor(_v_tr_layout, elem_dtype)
+                fx.copy(_v_tr_atom, src, dst)
+                half_hi_1 = Vec(dst.load())
+                v_hi_out[dc] = half_hi_0.shuffle(half_hi_1, list(range(8))).ir_value()
             return v_lo_out, v_hi_out
         return _read
 
@@ -780,7 +829,7 @@ def flex_attn_16x16_kernel(
     # Each thread has 2 queries: q_lo (t0) and q_hi (16+t0).
     # For q_lo: scores from tiles c00 (lo scores) + c10 (hi scores) = 8 values.
     # For q_hi: scores from tiles c01 (lo scores) + c11 (hi scores) = 8 values.
-    # Reduce across t1 groups via shuffle_xor(16) + permlane32_swap.
+    # Reduce across t1 groups via permlane16_swap XOR-16 + permlane32_swap.
     # After reduction, each thread has the per-query max/sum for both queries.
 
     # Per-thread flag: does this thread's PV query (t%32) correspond to query_hi?
@@ -813,7 +862,7 @@ def flex_attn_16x16_kernel(
         for i in range_constexpr(1, 8):
             tile_max_hi = tile_max_hi.maximumf(s_hi[i])
 
-        # Cross-lane reduction (4 k-groups)
+        # Cross-lane reduction (4 k-groups) via permlane16_swap
         tile_max_lo = _reduce_16x16_max(tile_max_lo)
         tile_max_hi = _reduce_16x16_max(tile_max_hi)
 
@@ -844,7 +893,7 @@ def flex_attn_16x16_kernel(
         # To get the other query's max, shuffle across the query boundary.
         # Threads 0-15 and 32-47 have query_lo; threads 16-31 and 48-63 have query_hi.
         # XOR 16 swaps between lo↔hi query threads within each half-wave.
-        m_other = _shuffle_xor_f32(m_new, 16)
+        _, m_other = _permlane16_xor_f32(m_new)
         m_lo = _is_hi_query.select(m_other, m_new)
         m_hi = _is_hi_query.select(m_new, m_other)
 
@@ -876,11 +925,11 @@ def flex_attn_16x16_kernel(
 
         return p_lo, p_hi, l_i_out, o_accs_out
 
-    # ── PV GEMM: register-only C→B conversion via shuffle_xor ──────────────
+    # ── PV GEMM: register-only C→B conversion via permlane16_swap ──────────
     # Convert 16×16 QK C-fragment P values to 32×32 PV B-operand format without LDS.
     # Each thread has p_lo[8] (query_lo scores) and p_hi[8] (query_hi scores).
     # The MFMA B operand needs 8 consecutive scores at each thread's PV query.
-    # shuffle_xor(16) exchanges values between _t1 groups 0↔1 and 2↔3.
+    # permlane16_swap XOR-16 exchanges values between _t1 groups 0↔1 and 2↔3.
     _t0_32 = local_tid % 32
     _t1_32 = local_tid // 32  # 0 or 1
     _is_odd_t1 = fx.Int32(_t1 & 1) != fx.Int32(0)
@@ -902,11 +951,13 @@ def flex_attn_16x16_kernel(
 
         p_lo[8]: P values at query=_t0 for scores {_t1*4..+3, 16+_t1*4..+3}
         p_hi[8]: P values at query=16+_t0 for same score pattern.
-        Repackaged into 32x32 MFMA B operands via shuffle_xor(16).
+        Repackaged into 32x32 MFMA B operands via permlane16_swap XOR-16.
         """
-        # Shuffle all P values with partner thread (_t1 XOR 1).
-        shuf_p_lo = [_shuffle_xor_f32(p_lo_vals[i], 16) for i in range_constexpr(8)]
-        shuf_p_hi = [_shuffle_xor_f32(p_hi_vals[i], 16) for i in range_constexpr(8)]
+        # Shuffle all P values with partner thread (_t1 XOR 1) via permlane16_swap
+        # (VALU pipeline, no LDS contention). Each call returns (own, partner);
+        # we keep the partner value (the lane N^16 exchange).
+        shuf_p_lo = [_permlane16_xor_f32(p_lo_vals[i])[1] for i in range_constexpr(8)]
+        shuf_p_hi = [_permlane16_xor_f32(p_hi_vals[i])[1] for i in range_constexpr(8)]
 
         # Even _t1 (0,2): use p_lo as "own", shuffled p_lo as "partner"
         #   p_b_lo = [own[0..3], partner[0..3]]  (scores at this thread's query)
@@ -982,29 +1033,6 @@ def flex_attn_16x16_kernel(
         c11 = fx.Vector.from_elements([valid.select(c11_v[i], _neg_inf) for i in range_constexpr(4)], fx.Float32).ir_value()
         return c00, c01, c10, c11
 
-    def _qk_softmax_start(slot, kv_i32, m_i):
-        """QK GEMM + mods + softmax_start. Returns (corr, s_lo, s_hi, m_new)."""
-        c00, c01, c10, c11 = gemm1_qk_16x16(slot)
-        if const_expr(mod_has_score or mod_has_mask):
-            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32)
-        corr, s_lo, s_hi, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
-        return corr, s_lo, s_hi, m_new
-
-    def _qk_softmax_start_masked(slot, kv_i32, m_i, valid):
-        """QK GEMM + mods + valid mask + softmax_start."""
-        c00, c01, c10, c11 = gemm1_qk_16x16(slot)
-        if const_expr(mod_has_score or mod_has_mask):
-            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32)
-        c00, c01, c10, c11 = _mask_scores(c00, c01, c10, c11, valid)
-        corr, s_lo, s_hi, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
-        return corr, s_lo, s_hi, m_new
-
-    def _finish_pv(s_lo, s_hi, m_i, l_i, o_accs, corr, v_lo, v_hi):
-        """softmax_finish + register PV GEMM. Returns (l_i, o_accs)."""
-        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(s_lo, s_hi, m_i[0], l_i, o_accs, corr)
-        pv_gemm_register(p_lo, p_hi, v_lo, v_hi, o_accs)
-        return l_i, o_accs
-
     # ── Overlapping softmax pipeline (4-cluster) ──────────────────────────
 
     def _do_tile_prologue(kv_i32, m_i, l_i, o_accs):
@@ -1021,7 +1049,10 @@ def flex_attn_16x16_kernel(
         rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
         dualwave_cluster_sync(0)
         # Cluster 1: QK tile 0, no deferred PV
-        corr_0, s_lo_0, s_hi_0, m_new = _qk_softmax_start(0, kv_i32, m_i)
+        c00, c01, c10, c11 = gemm1_qk_16x16(0)
+        if const_expr(mod_has_score or mod_has_mask):
+            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32)
+        corr_0, s_lo_0, s_hi_0, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
         m_i = [m_new]
         dualwave_cluster_sync(1)
         # Cluster 2: mem tile 1
@@ -1033,9 +1064,15 @@ def flex_attn_16x16_kernel(
             _safe_load_kv(kv_i32 + fx.Int32(2), 0)
         rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
         dualwave_cluster_sync(2)
-        # Cluster 3: QK tile 1 + PV from tile 0
-        l_i, o_accs = _finish_pv(s_lo_0, s_hi_0, m_i, l_i, o_accs, corr_0, v_lo_0, v_hi_0)
-        corr_1, s_lo_1, s_hi_1, m_new = _qk_softmax_start_masked(1, kv_i32 + fx.Int32(1), m_i, odd_valid)
+        # Cluster 3: QK tile 1 + PV from tile 0 (INTERLEAVED)
+        c00, c01, c10, c11 = gemm1_qk_16x16(1)
+        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(
+            s_lo_0, s_hi_0, m_i[0], l_i, o_accs, corr_0)
+        pv_gemm_register(p_lo, p_hi, v_lo_0, v_hi_0, o_accs)
+        if const_expr(mod_has_score or mod_has_mask):
+            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32 + fx.Int32(1))
+        c00, c01, c10, c11 = _mask_scores(c00, c01, c10, c11, odd_valid)
+        corr_1, s_lo_1, s_hi_1, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
         m_i = [m_new]
         dualwave_cluster_sync(3)
         return (m_i, l_i, o_accs,
@@ -1051,9 +1088,14 @@ def flex_attn_16x16_kernel(
         _safe_load_kv(kv_i32 + fx.Int32(1), 1)
         rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
         dualwave_cluster_sync(0)
-        # Cluster 1: QK tile 0 + deferred PV from prev
-        l_i, o_accs = _finish_pv(s_lo_prev, s_hi_prev, m_i_prev, l_i, o_accs, corr_prev, v_lo_prev, v_hi_prev)
-        corr_0, s_lo_0, s_hi_0, m_new = _qk_softmax_start(0, kv_i32, m_i)
+        # Cluster 1: QK tile 0 + deferred PV from prev (INTERLEAVED)
+        c00, c01, c10, c11 = gemm1_qk_16x16(0)
+        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(
+            s_lo_prev, s_hi_prev, m_i_prev[0], l_i, o_accs, corr_prev)
+        pv_gemm_register(p_lo, p_hi, v_lo_prev, v_hi_prev, o_accs)
+        if const_expr(mod_has_score or mod_has_mask):
+            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32)
+        corr_0, s_lo_0, s_hi_0, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
         m_i = [m_new]
         dualwave_cluster_sync(1)
         # Cluster 2: mem tile 1
@@ -1063,9 +1105,14 @@ def flex_attn_16x16_kernel(
         _safe_load_kv(kv_i32 + fx.Int32(2), 0)
         rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
         dualwave_cluster_sync(2)
-        # Cluster 3: QK tile 1 + PV from tile 0
-        l_i, o_accs = _finish_pv(s_lo_0, s_hi_0, m_i, l_i, o_accs, corr_0, v_lo_0, v_hi_0)
-        corr_1, s_lo_1, s_hi_1, m_new = _qk_softmax_start(1, kv_i32 + fx.Int32(1), m_i)
+        # Cluster 3: QK tile 1 + PV from tile 0 (INTERLEAVED)
+        c00, c01, c10, c11 = gemm1_qk_16x16(1)
+        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(
+            s_lo_0, s_hi_0, m_i[0], l_i, o_accs, corr_0)
+        pv_gemm_register(p_lo, p_hi, v_lo_0, v_hi_0, o_accs)
+        if const_expr(mod_has_score or mod_has_mask):
+            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32 + fx.Int32(1))
+        corr_1, s_lo_1, s_hi_1, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
         m_i = [m_new]
         dualwave_cluster_sync(3)
         return (m_i, l_i, o_accs,
@@ -1085,9 +1132,14 @@ def flex_attn_16x16_kernel(
             _safe_load_kv(kv_i32 + fx.Int32(1), 1)
         rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
         dualwave_cluster_sync(0)
-        # Cluster 1: QK tile 0 + deferred PV from prev
-        l_i, o_accs = _finish_pv(s_lo_prev, s_hi_prev, m_i_prev, l_i, o_accs, corr_prev, v_lo_prev, v_hi_prev)
-        corr_0, s_lo_0, s_hi_0, m_new = _qk_softmax_start(0, kv_i32, m_i)
+        # Cluster 1: QK tile 0 + deferred PV from prev (INTERLEAVED)
+        c00, c01, c10, c11 = gemm1_qk_16x16(0)
+        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(
+            s_lo_prev, s_hi_prev, m_i_prev[0], l_i, o_accs, corr_prev)
+        pv_gemm_register(p_lo, p_hi, v_lo_prev, v_hi_prev, o_accs)
+        if const_expr(mod_has_score or mod_has_mask):
+            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32)
+        corr_0, s_lo_0, s_hi_0, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
         m_i = [m_new]
         dualwave_cluster_sync(1)
         # Cluster 2: mem tile 1
@@ -1099,12 +1151,20 @@ def flex_attn_16x16_kernel(
             _safe_load_kv(kv_i32 + fx.Int32(2), 0)
         rocdl.s_waitcnt(_WAIT_LGKMCNT_0)
         dualwave_cluster_sync(2)
-        # Cluster 3: QK tile 1 + PV from tile 0 + final deferred
-        l_i, o_accs = _finish_pv(s_lo_0, s_hi_0, m_i, l_i, o_accs, corr_0, v_lo_0, v_hi_0)
-        corr_1, s_lo_1, s_hi_1, m_new = _qk_softmax_start_masked(1, kv_i32 + fx.Int32(1), m_i, odd_valid)
+        # Cluster 3: QK tile 1 + PV from tile 0 + final deferred (INTERLEAVED)
+        c00, c01, c10, c11 = gemm1_qk_16x16(1)
+        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(
+            s_lo_0, s_hi_0, m_i[0], l_i, o_accs, corr_0)
+        pv_gemm_register(p_lo, p_hi, v_lo_0, v_hi_0, o_accs)
+        if const_expr(mod_has_score or mod_has_mask):
+            c00, c01, c10, c11 = apply_mods_16x16(c00, c01, c10, c11, kv_i32 + fx.Int32(1))
+        c00, c01, c10, c11 = _mask_scores(c00, c01, c10, c11, odd_valid)
+        corr_1, s_lo_1, s_hi_1, m_new = softmax_start_16x16(c00, c01, c10, c11, m_i)
         m_i = [m_new]
         # Flush final deferred PV
-        l_i, o_accs = _finish_pv(s_lo_1, s_hi_1, m_i, l_i, o_accs, corr_1, v_lo_1, v_hi_1)
+        p_lo, p_hi, l_i, o_accs = softmax_finish_16x16(
+            s_lo_1, s_hi_1, m_i[0], l_i, o_accs, corr_1)
+        pv_gemm_register(p_lo, p_hi, v_lo_1, v_hi_1, o_accs)
         dualwave_cluster_sync(3)
         return m_i, l_i, o_accs
 
