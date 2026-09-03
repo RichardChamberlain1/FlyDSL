@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Correctness test for the layout-API flex/flash attention forward (gfx950).
 
-Compares flydsl_flex_attention_layout against torch scaled_dot_product_attention
+Compares flydsl_flex_attention against torch scaled_dot_product_attention
 (non-causal). gfx950-only (uses cdna4-era MFMA + the layout API); skipped elsewhere.
 
 Phase 0 kernel constraints (see the kernel's make_flex_attn_param): block_m=32,
@@ -28,13 +28,13 @@ if not torch.cuda.is_available():
 import pytest  # noqa: E402
 
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
-from kernels.attention.flex_attention_layout_gfx950 import (  # noqa: E402
+from kernels.attention.flex_attention_gfx950 import (  # noqa: E402
     MASK_CAUSAL,
     MASK_PREFIX_LM,
     MASK_SLIDING_WINDOW,
     SCORE_ALIBI,
-    flydsl_flex_attention_layout,
-    flydsl_flex_attention_layout_paged,
+    flydsl_flex_attention,
+    flydsl_flex_attention_paged,
 )
 
 _requires_gfx950 = pytest.mark.skipif(
@@ -69,7 +69,7 @@ def _run(B, Sq, Skv, H, D, dtype_str, *, num_groups=8, accurate_softmax=True, pi
     v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -98,7 +98,7 @@ _SHAPES = [
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _SHAPES)
-def test_flex_attention_layout(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention(B, Sq, Skv, H, D, dtype_str):
     max_err, cos = _run(B, Sq, Skv, H, D, dtype_str)
     assert max_err < 8e-2 and cos > 0.98, f"B{B} Sq{Sq} Skv{Skv} H{H} D{D} {dtype_str}: max_err={max_err} cos={cos}"
 
@@ -106,7 +106,7 @@ def test_flex_attention_layout(B, Sq, Skv, H, D, dtype_str):
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _SHAPES)
-def test_flex_attention_layout_approx_softmax(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_approx_softmax(B, Sq, Skv, H, D, dtype_str):
     _, cos = _run(B, Sq, Skv, H, D, dtype_str, accurate_softmax=False)
     assert cos > 0.95, f"approx B{B} Sq{Sq} Skv{Skv} H{H} D{D} {dtype_str}: cos={cos}"
 
@@ -124,7 +124,7 @@ _MOD_SHAPES = [
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
-def test_flex_attention_layout_causal(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_causal(B, Sq, Skv, H, D, dtype_str):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     torch.manual_seed(0)
@@ -133,7 +133,7 @@ def test_flex_attention_layout_causal(B, Sq, Skv, H, D, dtype_str):
     v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -151,7 +151,7 @@ def test_flex_attention_layout_causal(B, Sq, Skv, H, D, dtype_str):
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
-def test_flex_attention_layout_alibi(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_alibi(B, Sq, Skv, H, D, dtype_str):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     torch.manual_seed(0)
@@ -161,7 +161,7 @@ def test_flex_attention_layout_alibi(B, Sq, Skv, H, D, dtype_str):
     scale = 1.0 / math.sqrt(D)
     slope = 0.125
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -184,7 +184,7 @@ def test_flex_attention_layout_alibi(B, Sq, Skv, H, D, dtype_str):
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
-def test_flex_attention_layout_sliding_window(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_sliding_window(B, Sq, Skv, H, D, dtype_str):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     torch.manual_seed(0)
@@ -194,7 +194,7 @@ def test_flex_attention_layout_sliding_window(B, Sq, Skv, H, D, dtype_str):
     scale = 1.0 / math.sqrt(D)
     window = 16
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -217,7 +217,7 @@ def test_flex_attention_layout_sliding_window(B, Sq, Skv, H, D, dtype_str):
 
 @_requires_gfx950
 @pytest.mark.parametrize("window", [33, 97])
-def test_flex_attention_layout_sliding_window_odd(window):
+def test_flex_attention_sliding_window_odd(window):
     """Non-block-aligned windows that straddle tile boundaries."""
     B, Sq, Skv, H, D = 2, 256, 256, 4, 128
     dtype = torch.bfloat16
@@ -228,7 +228,7 @@ def test_flex_attention_layout_sliding_window_odd(window):
     v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -250,7 +250,7 @@ def test_flex_attention_layout_sliding_window_odd(window):
 
 @_requires_gfx950
 @pytest.mark.parametrize("Hq,Hkv", [(8, 1), (8, 2), (32, 8)])
-def test_flex_attention_layout_gqa(Hq, Hkv):
+def test_flex_attention_gqa(Hq, Hkv):
     B, Sq, Skv, D = 1, 256, 256, 128
     dtype = torch.bfloat16
     dev = "cuda"
@@ -260,7 +260,7 @@ def test_flex_attention_layout_gqa(Hq, Hkv):
     v = torch.empty(B, Skv, Hkv, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -279,7 +279,7 @@ def test_flex_attention_layout_gqa(Hq, Hkv):
 
 @_requires_gfx950
 @pytest.mark.parametrize("num_groups", [4, 8])
-def test_flex_attention_layout_multi_group(num_groups):
+def test_flex_attention_multi_group(num_groups):
     B, Sq, Skv, H, D = 1, num_groups * 32, 128, 4, 128
     dtype = torch.bfloat16
     dev = "cuda"
@@ -289,7 +289,7 @@ def test_flex_attention_layout_multi_group(num_groups):
     v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -303,7 +303,7 @@ def test_flex_attention_layout_multi_group(num_groups):
 
 
 @_requires_gfx950
-def test_flex_attention_layout_sliding_window_full():
+def test_flex_attention_sliding_window_full():
     """Window >= Skv: everything visible, should match dense."""
     B, Sq, Skv, H, D = 1, 256, 256, 4, 128
     dtype = torch.bfloat16
@@ -314,7 +314,7 @@ def test_flex_attention_layout_sliding_window_full():
     v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -331,7 +331,7 @@ def test_flex_attention_layout_sliding_window_full():
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
-def test_flex_attention_layout_prefix_lm(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_prefix_lm(B, Sq, Skv, H, D, dtype_str):
     prefix_len = max(1, Sq // 4)
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
@@ -341,7 +341,7 @@ def test_flex_attention_layout_prefix_lm(B, Sq, Skv, H, D, dtype_str):
     v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -364,7 +364,7 @@ def test_flex_attention_layout_prefix_lm(B, Sq, Skv, H, D, dtype_str):
 
 @_requires_gfx950
 @pytest.mark.parametrize("num_groups", [4, 8])
-def test_flex_attention_layout_causal_multi_group(num_groups):
+def test_flex_attention_causal_multi_group(num_groups):
     B, Sq, Skv, H, D = 1, num_groups * 32, num_groups * 32, 4, 128
     dtype = torch.bfloat16
     dev = "cuda"
@@ -374,7 +374,7 @@ def test_flex_attention_layout_causal_multi_group(num_groups):
     v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -435,7 +435,7 @@ def _make_block_table(B, Skv, block_n, device):
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _PAGED_SHAPES)
-def test_flex_attention_layout_paged(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_paged(B, Sq, Skv, H, D, dtype_str):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     block_n = 32
@@ -450,7 +450,7 @@ def test_flex_attention_layout_paged(B, Sq, Skv, H, D, dtype_str):
     block_table, context_lens, total_pages = _make_block_table(B, Skv, block_n, dev)
     k_cache, v_cache = _scatter_to_paged(k, v, block_n, block_table, context_lens)
 
-    out = flydsl_flex_attention_layout_paged(
+    out = flydsl_flex_attention_paged(
         q,
         k_cache,
         v_cache,
@@ -468,7 +468,7 @@ def test_flex_attention_layout_paged(B, Sq, Skv, H, D, dtype_str):
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _PAGED_SHAPES)
-def test_flex_attention_layout_paged_causal(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_paged_causal(B, Sq, Skv, H, D, dtype_str):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     block_n = 32
@@ -483,7 +483,7 @@ def test_flex_attention_layout_paged_causal(B, Sq, Skv, H, D, dtype_str):
     block_table, context_lens, total_pages = _make_block_table(B, Skv, block_n, dev)
     k_cache, v_cache = _scatter_to_paged(k, v, block_n, block_table, context_lens)
 
-    out = flydsl_flex_attention_layout_paged(
+    out = flydsl_flex_attention_paged(
         q,
         k_cache,
         v_cache,
@@ -516,7 +516,7 @@ _SPLIT_KV_SHAPES = [
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _SPLIT_KV_SHAPES)
-def test_flex_attention_layout_split_kv(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_split_kv(B, Sq, Skv, H, D, dtype_str):
     max_err, cos = _run(B, Sq, Skv, H, D, dtype_str, pipe_depth=3)
     assert (
         max_err < 8e-2 and cos > 0.98
@@ -526,7 +526,7 @@ def test_flex_attention_layout_split_kv(B, Sq, Skv, H, D, dtype_str):
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
-def test_flex_attention_layout_split_kv_causal(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_split_kv_causal(B, Sq, Skv, H, D, dtype_str):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     torch.manual_seed(0)
@@ -535,7 +535,7 @@ def test_flex_attention_layout_split_kv_causal(B, Sq, Skv, H, D, dtype_str):
     v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
     scale = 1.0 / math.sqrt(D)
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -554,7 +554,7 @@ def test_flex_attention_layout_split_kv_causal(B, Sq, Skv, H, D, dtype_str):
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
-def test_flex_attention_layout_split_kv_sliding_window(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_split_kv_sliding_window(B, Sq, Skv, H, D, dtype_str):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     torch.manual_seed(0)
@@ -564,7 +564,7 @@ def test_flex_attention_layout_split_kv_sliding_window(B, Sq, Skv, H, D, dtype_s
     scale = 1.0 / math.sqrt(D)
     window = 16
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,
@@ -590,7 +590,7 @@ def test_flex_attention_layout_split_kv_sliding_window(B, Sq, Skv, H, D, dtype_s
 @_requires_gfx950
 @pytest.mark.parametrize("dtype_str", ["bf16"])
 @pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
-def test_flex_attention_layout_split_kv_alibi(B, Sq, Skv, H, D, dtype_str):
+def test_flex_attention_split_kv_alibi(B, Sq, Skv, H, D, dtype_str):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     torch.manual_seed(0)
@@ -600,7 +600,7 @@ def test_flex_attention_layout_split_kv_alibi(B, Sq, Skv, H, D, dtype_str):
     scale = 1.0 / math.sqrt(D)
     slope = 0.125
 
-    out = flydsl_flex_attention_layout(
+    out = flydsl_flex_attention(
         q,
         k,
         v,

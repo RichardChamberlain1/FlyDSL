@@ -254,8 +254,8 @@ class FlexAttnParam:
     # loop. Each group runs the validated 32-row body on rows
     # [group*block_m : (group+1)*block_m); K/V are loaded once and reused across all
     # groups (strategy A). Total query rows per workgroup = num_groups*block_m.
-    # Default 8: fills all 8 SIMDs/CU (8 groups × 1 wave × 64 threads = 512) and
-    # enables wave-group stagger for overlapping DMA with compute.
+    # Default 8: 512-thread / 8-wave baseline. Up to 16 groups (1024 threads) is
+    # experimental (LDS and stagger untuned above 8).
     num_groups: fx.Constexpr[int]
     # mma shape
     mma_m: fx.Constexpr[int]
@@ -348,15 +348,24 @@ def make_flex_attn_param(
             f"(got num_groups={num_groups}, m_waves={m_waves})"
         )
 
+    # Fit within wave budget. 8 waves = 512-thread baseline; 16 waves experimental.
+    _full_simd_waves = 8
+    _max_waves = 16
+    while m_waves > 1 and num_groups * m_waves > _full_simd_waves:
+        candidate = m_waves - 1
+        if block_m % (candidate * mma_m) != 0:
+            break
+        m_waves = candidate
+
     in_dbytes = 2
 
     group_threads = m_waves * n_waves * GFX950_WAVE_SIZE
     block_threads = num_groups * group_threads
-    _max_waves = 8
-    if block_threads > _max_waves * GFX950_WAVE_SIZE:
+    if num_groups * m_waves > _max_waves:
         raise ValueError(
-            f"block_threads ({block_threads}) exceeds {_max_waves} SIMDs/CU limit "
-            f"({_max_waves * GFX950_WAVE_SIZE} threads); reduce num_groups or m_waves"
+            f"num_groups ({num_groups}) × m_waves ({m_waves}) = {num_groups * m_waves} waves "
+            f"exceeds {_max_waves}-wave limit ({_max_waves * GFX950_WAVE_SIZE} threads); "
+            f"reduce num_groups or m_waves"
         )
 
     return FlexAttnParam(
@@ -396,7 +405,7 @@ def _flex_stagger_divisor(block_threads: int) -> int:
     return max(1, total_waves // 2)
 
 
-def flex_layout_stagger_enabled(param: FlexAttnParam) -> bool:
+def flex_stagger_enabled(param: FlexAttnParam) -> bool:
     """True when wave-group stagger is active for this param."""
     total_waves = int(param.block_threads) // GFX950_WAVE_SIZE
     if int(param.mma_m) == 32:
@@ -416,7 +425,7 @@ def make_flex_attn_kernel_name(param: FlexAttnParam) -> str:
     name += "_dense"
     name += "_rsm" if param.accurate_softmax else "_csm"
     name += f"_pd{param.pipe_depth}"
-    if flex_layout_stagger_enabled(param):
+    if flex_stagger_enabled(param):
         name += "_stg"
     return name
 
@@ -545,32 +554,53 @@ def flex_attn_fwd_gfx950_kernel(
     kv_tile_elems = block_n * head_dim
     _v_subtile_elems = block_n * 32
     _v_step_elems = _v_subtile_elems // 4  # 256 elements per step (8 rows × 32 cols)
-    _lds_ring_slots = max(2, int(param.pipe_depth))
+    _lds_ring_slots = 2  # ping-pong K/V; pipe_depth selects schedule, not buffer count
 
     _k_lds_pad_elems = _K_HALF_BANK_SKEW_ELEMS + _LDS_RING_BANK_SKEW_ELEMS
     _q_lds_tile_elems = block_m * head_dim  # 32×128 = 4096 bf16 per group
     _q_inline_lds = int(param.pipe_depth) == 3  # Q inline from LDS only for split_kv schedule
 
     if const_expr(_paged):
+        if const_expr(_q_inline_lds):
 
-        @fx.struct
-        class SharedStorage:
-            k_lds_0: fx.Array[elem_dtype, kv_tile_elems + _K_HALF_BANK_SKEW_ELEMS, 16]
-            k_lds_1: fx.Array[elem_dtype, kv_tile_elems + _k_lds_pad_elems, 16]
-            v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
-            v_lds_1: fx.Array[elem_dtype, kv_tile_elems + _LDS_RING_BANK_SKEW_ELEMS, 16]
-            q_lds: fx.Array[elem_dtype, num_groups * _q_lds_tile_elems, 16]
-            bt: fx.Array[fx.Int32, _PAGED_BT_LDS_SIZE, 16]
+            @fx.struct
+            class SharedStorage:
+                k_lds_0: fx.Array[elem_dtype, kv_tile_elems + _K_HALF_BANK_SKEW_ELEMS, 16]
+                k_lds_1: fx.Array[elem_dtype, kv_tile_elems + _k_lds_pad_elems, 16]
+                v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
+                v_lds_1: fx.Array[elem_dtype, kv_tile_elems + _LDS_RING_BANK_SKEW_ELEMS, 16]
+                q_lds: fx.Array[elem_dtype, num_groups * _q_lds_tile_elems, 16]
+                bt: fx.Array[fx.Int32, _PAGED_BT_LDS_SIZE, 16]
+
+        else:
+
+            @fx.struct
+            class SharedStorage:
+                k_lds_0: fx.Array[elem_dtype, kv_tile_elems + _K_HALF_BANK_SKEW_ELEMS, 16]
+                k_lds_1: fx.Array[elem_dtype, kv_tile_elems + _k_lds_pad_elems, 16]
+                v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
+                v_lds_1: fx.Array[elem_dtype, kv_tile_elems + _LDS_RING_BANK_SKEW_ELEMS, 16]
+                bt: fx.Array[fx.Int32, _PAGED_BT_LDS_SIZE, 16]
 
     else:
+        if const_expr(_q_inline_lds):
 
-        @fx.struct
-        class SharedStorage:
-            k_lds_0: fx.Array[elem_dtype, kv_tile_elems + _K_HALF_BANK_SKEW_ELEMS, 16]
-            k_lds_1: fx.Array[elem_dtype, kv_tile_elems + _k_lds_pad_elems, 16]
-            v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
-            v_lds_1: fx.Array[elem_dtype, kv_tile_elems + _LDS_RING_BANK_SKEW_ELEMS, 16]
-            q_lds: fx.Array[elem_dtype, num_groups * _q_lds_tile_elems, 16]
+            @fx.struct
+            class SharedStorage:
+                k_lds_0: fx.Array[elem_dtype, kv_tile_elems + _K_HALF_BANK_SKEW_ELEMS, 16]
+                k_lds_1: fx.Array[elem_dtype, kv_tile_elems + _k_lds_pad_elems, 16]
+                v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
+                v_lds_1: fx.Array[elem_dtype, kv_tile_elems + _LDS_RING_BANK_SKEW_ELEMS, 16]
+                q_lds: fx.Array[elem_dtype, num_groups * _q_lds_tile_elems, 16]
+
+        else:
+
+            @fx.struct
+            class SharedStorage:
+                k_lds_0: fx.Array[elem_dtype, kv_tile_elems + _K_HALF_BANK_SKEW_ELEMS, 16]
+                k_lds_1: fx.Array[elem_dtype, kv_tile_elems + _k_lds_pad_elems, 16]
+                v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
+                v_lds_1: fx.Array[elem_dtype, kv_tile_elems + _LDS_RING_BANK_SKEW_ELEMS, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     _k1_ptr = storage.k_lds_1.peek().ptr
@@ -582,11 +612,12 @@ def flex_attn_fwd_gfx950_kernel(
     sK_ptr = [storage.k_lds_0.peek().ptr, _k1_ptr]
     sV_ptr = [storage.v_lds_0.peek().ptr, _v1_ptr]
 
-    # Q LDS: per-group [block_m, head_dim] D-contiguous, loaded once, read per-ki.
-    sQ_base_ptr = storage.q_lds.peek().ptr
-    _q_lds_layout = fx.make_layout((block_m, head_dim), (head_dim, 1))
-    sQ_ptr = fx.add_offset(sQ_base_ptr, fx.make_int_tuple(group * _q_lds_tile_elems))
-    sQ = fx.make_view(sQ_ptr, _q_lds_layout)
+    # Q LDS: per-group [block_m, head_dim] D-contiguous (pipe_depth=3 only).
+    if const_expr(_q_inline_lds):
+        sQ_base_ptr = storage.q_lds.peek().ptr
+        _q_lds_layout = fx.make_layout((block_m, head_dim), (head_dim, 1))
+        sQ_ptr = fx.add_offset(sQ_base_ptr, fx.make_int_tuple(group * _q_lds_tile_elems))
+        sQ = fx.make_view(sQ_ptr, _q_lds_layout)
 
     # K LDS: D-contiguous tile with GEMM-style XOR swizzle (Swizzle 2,4,3 when D=128).
     _k_base_layout = _make_k_lds_layout(block_n, head_dim)
@@ -739,14 +770,17 @@ def flex_attn_fwd_gfx950_kernel(
     sV_i8 = [fx.recast_iter(fx.Int8, sV_ptr[i]) for i in range_constexpr(_lds_ring_slots)]
     _k_half_d = int(head_dim) // 2  # 64 for D=128; ki 0..3 = D-lo, ki 4..7 = D-hi
     # sK_upper: same layout as sK, base + _K_HALF_BANK_SKEW_BYTES (16B) for ki>=4 reads.
-    sK_upper_ptr = [
-        fx.recast_iter(
-            elem_dtype,
-            fx.add_offset(sK_i8[i], fx.Int32(_K_HALF_BANK_SKEW_BYTES)),
-        )
-        for i in range_constexpr(_lds_ring_slots)
-    ]
-    sK_upper = [fx.make_view(sK_upper_ptr[i], _k_base_layout) for i in range_constexpr(_lds_ring_slots)]
+    if _K_HALF_BANK_SKEW_BYTES > 0:
+        sK_upper_ptr = [
+            fx.recast_iter(
+                elem_dtype,
+                fx.add_offset(sK_i8[i], fx.Int32(_K_HALF_BANK_SKEW_BYTES)),
+            )
+            for i in range_constexpr(_lds_ring_slots)
+        ]
+        sK_upper = [fx.make_view(sK_upper_ptr[i], _k_base_layout) for i in range_constexpr(_lds_ring_slots)]
+    else:
+        sK_upper = sK
 
     def _k_swizzled_col(tile_row, tile_col_elem):
         """Apply K swizzle to get the global column index for a given LDS position."""
@@ -1123,6 +1157,7 @@ def flex_attn_fwd_gfx950_kernel(
     if const_expr(_q_inline_lds):
         _q_lds_src = tcB_q_lds.partition_S(sQ)
         _q_lds_retile = tcB_q_lds.retile(frag_Q)
+
         _k_src_slots = [tcA_k_lds[i].partition_S(sK[i]) for i in range_constexpr(_lds_ring_slots)]
 
         def _read_q_ki_into_frag(ki):
@@ -1987,11 +2022,12 @@ def flex_attn_fwd_gfx950_kernel(
 
     # O normalization: divide each v16f32 by l_i[0].
     # Guard against fully-masked rows (l_i == 0) producing NaN.
+    _l0 = fx.Float32(l_i[0])
     if const_expr(flex_mod.needs_safe_norm):
-        _safe_l = l_i[0].maximumf(fx.Float32(1e-12))
+        _safe_l = _l0.maximumf(fx.Float32(1e-12))
         inv_l = fx.Float32(rocdl.rcp(T.f32, _safe_l.ir_value()))
     else:
-        inv_l = fx.Float32(rocdl.rcp(T.f32, l_i[0].ir_value()))
+        inv_l = fx.Float32(rocdl.rcp(T.f32, _l0.ir_value()))
     inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(16)
     for dc in range_constexpr(_n_d_chunks):
         o_accs[dc] = (Vec(o_accs[dc]) * inv_l_vec).ir_value()
@@ -2219,7 +2255,7 @@ def launch_flex_attn_gfx950(
     flex_attn_fwd_gfx950_kernel._known_block_size = [param.block_threads, 1, 1]
     flex_attn_fwd_gfx950_kernel._func.__name__ = make_flex_attn_kernel_name(param)
     _total_waves = int(param.block_threads) // GFX950_WAVE_SIZE
-    _waves_per_eu = max(1, _total_waves // 4)
+    _waves_per_eu = min(4, max(1, _total_waves // 4))
 
     if const_expr(_SPLITK):
         grid_z = b * fx.Int32(_num_kv_splits)
@@ -2284,7 +2320,7 @@ _flex_attn_compile_hints = {
 launch_flex_attn_gfx950.compile_hints = dict(_flex_attn_compile_hints)
 
 
-def flydsl_flex_attention_layout(
+def flydsl_flex_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2317,9 +2353,10 @@ def flydsl_flex_attention_layout(
 
     ``pipe_depth >= 2`` requires ``num_groups >= 2`` (staggered Strategy A pipeline).
     """
+
     arch = get_rocm_arch()
     if not arch.startswith("gfx950"):
-        raise RuntimeError(f"flex_attention_layout targets gfx950; got {arch!r}")
+        raise RuntimeError(f"flex_attention targets gfx950; got {arch!r}")
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("q/k/v must be CUDA tensors")
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -2346,7 +2383,7 @@ def flydsl_flex_attention_layout(
     if out is None:
         out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
 
-    if pipe_depth >= 2 and num_groups < 2:
+    if pipe_depth >= 2 and pipe_depth != 3 and num_groups < 2:
         raise ValueError("pipe_depth>=2 requires num_groups>=2 (Strategy A staggered pipeline)")
 
     param = make_flex_attn_param(
@@ -2396,7 +2433,7 @@ def flydsl_flex_attention_layout(
     return out
 
 
-def flydsl_flex_attention_layout_paged(
+def flydsl_flex_attention_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -2426,7 +2463,7 @@ def flydsl_flex_attention_layout_paged(
     """
     arch = get_rocm_arch()
     if not arch.startswith("gfx950"):
-        raise RuntimeError(f"flex_attention_layout_paged targets gfx950; got {arch!r}")
+        raise RuntimeError(f"flex_attention_paged targets gfx950; got {arch!r}")
     if not (q.is_cuda and k_cache.is_cuda and v_cache.is_cuda):
         raise ValueError("q/k_cache/v_cache must be CUDA tensors")
     if q.dtype != k_cache.dtype or q.dtype != v_cache.dtype:
@@ -2505,5 +2542,5 @@ def flydsl_flex_attention_layout_paged(
 
 FLEX_DTYPE_FP8 = 4  # stub for test imports
 
-def flydsl_flex_attention_layout_fp8(*args, **kwargs):
+def flydsl_flex_attention_fp8(*args, **kwargs):
     raise NotImplementedError("FP8 flex attention is not supported in this build")
