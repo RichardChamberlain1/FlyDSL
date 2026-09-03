@@ -548,6 +548,8 @@ def flex_attn_fwd_gfx950_kernel(
     _lds_ring_slots = max(2, int(param.pipe_depth))
 
     _k_lds_pad_elems = _K_HALF_BANK_SKEW_ELEMS + _LDS_RING_BANK_SKEW_ELEMS
+    _q_lds_tile_elems = block_m * head_dim  # 32×128 = 4096 bf16 per group
+    _q_inline_lds = int(param.pipe_depth) == 3  # Q inline from LDS only for split_kv schedule
 
     if const_expr(_paged):
 
@@ -557,7 +559,7 @@ def flex_attn_fwd_gfx950_kernel(
             k_lds_1: fx.Array[elem_dtype, kv_tile_elems + _k_lds_pad_elems, 16]
             v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
             v_lds_1: fx.Array[elem_dtype, kv_tile_elems + _LDS_RING_BANK_SKEW_ELEMS, 16]
-            p: fx.Array[elem_dtype, num_groups * block_m * block_n, 16]
+            q_lds: fx.Array[elem_dtype, num_groups * _q_lds_tile_elems, 16]
             bt: fx.Array[fx.Int32, _PAGED_BT_LDS_SIZE, 16]
 
     else:
@@ -568,7 +570,7 @@ def flex_attn_fwd_gfx950_kernel(
             k_lds_1: fx.Array[elem_dtype, kv_tile_elems + _k_lds_pad_elems, 16]
             v_lds_0: fx.Array[elem_dtype, kv_tile_elems, 16]
             v_lds_1: fx.Array[elem_dtype, kv_tile_elems + _LDS_RING_BANK_SKEW_ELEMS, 16]
-            p: fx.Array[elem_dtype, num_groups * block_m * block_n, 16]
+            q_lds: fx.Array[elem_dtype, num_groups * _q_lds_tile_elems, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     _k1_ptr = storage.k_lds_1.peek().ptr
@@ -580,12 +582,18 @@ def flex_attn_fwd_gfx950_kernel(
     sK_ptr = [storage.k_lds_0.peek().ptr, _k1_ptr]
     sV_ptr = [storage.v_lds_0.peek().ptr, _v1_ptr]
 
+    # Q LDS: per-group [block_m, head_dim] D-contiguous, loaded once, read per-ki.
+    sQ_base_ptr = storage.q_lds.peek().ptr
+    _q_lds_layout = fx.make_layout((block_m, head_dim), (head_dim, 1))
+    sQ_ptr = fx.add_offset(sQ_base_ptr, fx.make_int_tuple(group * _q_lds_tile_elems))
+    sQ = fx.make_view(sQ_ptr, _q_lds_layout)
+
     # K LDS: D-contiguous tile with GEMM-style XOR swizzle (Swizzle 2,4,3 when D=128).
     _k_base_layout = _make_k_lds_layout(block_n, head_dim)
     sK = [fx.make_view(sK_ptr[i], _k_base_layout) for i in range_constexpr(_lds_ring_slots)]
-    # Per-group P-bridge region: group g uses [g*block_m*block_n : +block_m*block_n).
+    # Shape-only view for thr_qk.partition_C / make_fragment_C (P bridge is register-only).
     sP = fx.make_view(
-        storage.p.peek().ptr + group * fx.Int32(block_m * block_n),
+        sK_ptr[0],
         fx.make_layout((block_m, block_n), (block_n, 1)),
     )
 
@@ -633,6 +641,13 @@ def flex_attn_fwd_gfx950_kernel(
             _q_scale = scale
         for qi in range_constexpr(n_q):
             frag_Q[qi] = _to_elem(_to_elem(frag_Q[qi], fx.Float32) * _q_scale, elem_dtype)
+
+    # Q inline from LDS: write pre-scaled Q from registers to Q LDS, then read per-ki.
+    if const_expr(_q_inline_lds):
+        tcB_q_lds = fx.make_tiled_copy_B(uca, tiled_mma_qk).get_slice(local_tid)
+        fx.copy(uca, tcB_q_lds.retile(frag_Q), tcB_q_lds.partition_D(sQ))
+        rocdl.s_waitcnt(lgkmcnt=0)
+        rocdl.s_barrier()
 
     # Persistent O accumulator: 4 × v16f32 (one per D-chunk).
     # With V=A, P=B PV GEMM: each v16f32 has 16 D-values at 1 query-row per lane.
@@ -686,7 +701,8 @@ def flex_attn_fwd_gfx950_kernel(
     #
     # Upper-D half (ki >= 4): sK_upper has +skew base when _K_HALF_BANK_SKEW_BYTES > 0 (currently disabled).
     tcA_k_lds = [fx.make_tiled_copy_A(uca, tiled_mma_qk).get_slice(local_tid) for _ in range_constexpr(_lds_ring_slots)]
-    frag_K = [thr_qk.make_fragment_A(sK[i]) for i in range_constexpr(_lds_ring_slots)]
+    _frag_K_single = thr_qk.make_fragment_A(sK[0])
+    frag_K = [_frag_K_single, _frag_K_single]
 
     # V is loaded as A operand for PV GEMM (V=A, P=B).
     # V LDS has 4 compact sub-tiles [block_n, 32]:(32, 1). LDSReadTrans16_64b
@@ -1043,8 +1059,8 @@ def flex_attn_fwd_gfx950_kernel(
     _k_half = _k_iters // 2  # 4 ki per half (D-lo / D-hi)
     _k_serpentine = tuple(c + (1 - j) if (c // 2) % 2 else c + j for c in range(0, _k_iters, 2) for j in range(2))
     _k_serpentine_rev = tuple(reversed(_k_serpentine))
-    _k_frag_retile_0 = tcA_k_lds[0].retile(frag_K[0])
-    _k_frag_retile_1 = tcA_k_lds[1].retile(frag_K[1])
+    _k_frag_retile_0 = tcA_k_lds[0].retile(_frag_K_single)
+    _k_frag_retile_1 = tcA_k_lds[1].retile(_frag_K_single)
 
     def read_k_work_split(ki_count=_k_half, ki_offset=0, slot=0):
         """Read ki_count K-panels from LDS into frag_K[slot] for QK MFMA A.
@@ -1102,6 +1118,48 @@ def flex_attn_fwd_gfx950_kernel(
         for ki in range_constexpr(_qk_k_reps):
             gemm1_qk_mfma(frag_S_out, frag_Q_in, frag_K_in, ki)
         return [frag_S_out]
+
+    # Q-from-LDS variant: read Q and K per-ki, interleaved with MFMA.
+    if const_expr(_q_inline_lds):
+        _q_lds_src = tcB_q_lds.partition_S(sQ)
+        _q_lds_retile = tcB_q_lds.retile(frag_Q)
+        _k_src_slots = [tcA_k_lds[i].partition_S(sK[i]) for i in range_constexpr(_lds_ring_slots)]
+
+        def _read_q_ki_into_frag(ki):
+            """Read one ki panel of Q from LDS into frag_Q[*,*,ki]."""
+            for n in range_constexpr(_qk_b_n_reps):
+                fx.copy(uca, _q_lds_src[None, n, ki], _q_lds_retile[None, n, ki])
+
+        def _read_k_ki_into_frag(ki, slot):
+            """Read one ki panel of K from LDS into frag_K[slot][*,*,ki]."""
+            k_src = _k_src_slots[slot]
+            for m in range_constexpr(_qk_a_m_reps):
+                if const_expr(slot == 0):
+                    fx.copy(uca, k_src[None, m, ki], _k_frag_retile_0[None, m, ki])
+                else:
+                    fx.copy(uca, k_src[None, m, ki], _k_frag_retile_1[None, m, ki])
+
+        def gemm1_qk_unrolled_q_lds(frag_K_in, slot=0):
+            """QK GEMM reading Q and K per-ki from LDS, interleaved with MFMA.
+
+            Both K and Q are read one ki panel at a time from LDS, with the
+            next ki prefetched behind the current MFMA (32 cycles hides the
+            ds_read). Only 2 ki panels of each are live at once (~16 VGPRs
+            for K+Q instead of 64).
+            """
+            frag_S_out = thr_qk.make_fragment_C(sP)
+            frag_S_out.fill(0.0)
+            _read_k_ki_into_frag(0, slot)
+            _read_q_ki_into_frag(0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            for ki in range_constexpr(_qk_k_reps):
+                if const_expr(ki < _qk_k_reps - 1):
+                    _read_k_ki_into_frag(ki + 1, slot)
+                    _read_q_ki_into_frag(ki + 1)
+                gemm1_qk_mfma(frag_S_out, frag_Q, frag_K_in, ki)
+                if const_expr(ki < _qk_k_reps - 1):
+                    rocdl.s_waitcnt(lgkmcnt=0)
+            return [frag_S_out]
 
     # ── Flex score/mask mod application ────────────────────────────────────
     # MFMA 32x32x16 C fragment with K=A, Q=B swap:
@@ -1336,16 +1394,14 @@ def flex_attn_fwd_gfx950_kernel(
             rocdl.sched_barrier(0)
             _stagger_extra_barrier_if_one(infra.stagger_i32)
 
-        # Read K(0) into frag_K[0] and prefetch K(1) + V(0) as background DMA.
-        read_k_work(0)
+        # Prefetch K(1) + V(0) as background DMA; K(0) already in slot0.
         load_k(_kv_lo + fx.Int32(1), 1)
         load_v(_kv_lo, 0)
-        rocdl.s_waitcnt(lgkmcnt=0)
         _waitcnt_vm_n(int(_dma_ops_per_thread))
         dualwave_cluster_sync(0)
 
-        # QK tile 0 — no deferred PV from previous.
-        (frag_S_pro,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+        # QK tile 0 — K and Q read per-ki from LDS inside the GEMM.
+        (frag_S_pro,) = gemm1_qk_unrolled_q_lds(frag_K[0], slot=0)
         s_raw_pro = [frag_S_pro[i] for i in range_constexpr(n_c)]
         if const_expr(mod_has_score or mod_has_mask):
             apply_mods(s_raw_pro, _kv_lo)
@@ -1372,18 +1428,16 @@ def flex_attn_fwd_gfx950_kernel(
         odd_valid_pro = (_kv_lo + fx.Int32(1)) < _kv_hi
         has_next_pro = (_kv_lo + fx.Int32(2)) < _kv_hi
 
-        # C4: read K(1) from slot1, load V(1) for odd PV
+        # C4: load V(1) for odd PV; K(1) already in slot1 from prefetch
         _s_nop(7)
         _sched_barrier(0)
         if odd_valid_pro:
             load_v(_kv_lo + fx.Int32(1), 1)
-        read_k_work(1)
-        rocdl.s_waitcnt(lgkmcnt=0)
         _waitcnt_vm_n(int(_dma_ops_per_thread))
         dualwave_cluster_sync(4)
 
-        # C5: QK tile 1
-        (frag_S_odd,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+        # C5: QK tile 1 — K and Q read per-ki from LDS
+        (frag_S_odd,) = gemm1_qk_unrolled_q_lds(frag_K[1], slot=1)
         s_raw_odd = [frag_S_odd[i] for i in range_constexpr(n_c)]
         if const_expr(mod_has_score or mod_has_mask):
             apply_mods(s_raw_odd, _kv_lo + fx.Int32(1))
@@ -1433,17 +1487,15 @@ def flex_attn_fwd_gfx950_kernel(
 
             kv_even = _kv_lo + (fx.Int32(arith.index_cast(T.i32, kv_mid)) + fx.Int32(1)) * fx.Int32(2)
 
-            # ── C0: load_v(even, slot0), read_k(slot0) ──
+            # ── C0: load_v(even, slot0); K(even) DMA from prev C6 must land ──
             _s_nop(7)
             _sched_barrier(0)
             load_v(kv_even, 0)
-            read_k_work(0)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            _waitcnt_vm_n(int(_dma_ops_per_thread))
             dualwave_cluster_sync(0)
 
-            # ── C1: QK GEMM tile even ──
-            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+            # ── C1: QK GEMM tile even (K+Q read per-ki from LDS) ──
+            (frag_S,) = gemm1_qk_unrolled_q_lds(frag_K[0], slot=0)
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
                 apply_mods(s_raw, kv_even)
@@ -1467,17 +1519,15 @@ def flex_attn_fwd_gfx950_kernel(
             l_i, o_accs = out_sm[2], out_sm[3]
             dualwave_cluster_sync(3)
 
-            # ── C4: load_v(odd, slot1), read_k(slot1) ──
+            # ── C4: load_v(odd, slot1); K(odd) DMA from C2 must land ──
             _s_nop(7)
             _sched_barrier(0)
             load_v(kv_even + fx.Int32(1), 1)
-            read_k_work(1)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            _waitcnt_vm_n(int(_dma_ops_per_thread))
             dualwave_cluster_sync(4)
 
-            # ── C5: QK GEMM tile odd ──
-            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+            # ── C5: QK GEMM tile odd (K+Q read per-ki from LDS) ──
+            (frag_S,) = gemm1_qk_unrolled_q_lds(frag_K[1], slot=1)
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
                 apply_mods(s_raw, kv_even + fx.Int32(1))
@@ -1534,18 +1584,16 @@ def flex_attn_fwd_gfx950_kernel(
             odd_valid = (kv_last + fx.Int32(1)) < _kv_hi
             has_next = (kv_last + fx.Int32(2)) < _kv_hi
 
-            # C0: load V(even), read K(slot0)
+            # C0: load V(even); K(even) DMA from prev C6 must land
             _s_nop(7)
             _sched_barrier(0)
             load_v(kv_last, 0)
-            read_k_work(0)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            _waitcnt_vm_n(int(_dma_ops_per_thread))
             rocdl.s_barrier()
             dualwave_cluster_sync(0)
 
-            # C1: QK even
-            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+            # C1: QK even (K+Q read per-ki from LDS)
+            (frag_S,) = gemm1_qk_unrolled_q_lds(frag_K[0], slot=0)
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
                 apply_mods(s_raw, kv_last)
@@ -1569,19 +1617,17 @@ def flex_attn_fwd_gfx950_kernel(
             l_i, o_accs = out_sm[2], out_sm[3]
             dualwave_cluster_sync(3)
 
-            # C4: load V(odd) if valid, read K(slot1)
+            # C4: load V(odd) if valid; K(odd) already in slot1
             _s_nop(7)
             _sched_barrier(0)
             if odd_valid:
                 load_v(kv_last + fx.Int32(1), 1)
-            read_k_work(1)
-            rocdl.s_waitcnt(lgkmcnt=0)
             _waitcnt_vm_n(int(_dma_ops_per_thread))
             rocdl.s_barrier()
             dualwave_cluster_sync(4)
 
-            # C5: QK odd
-            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+            # C5: QK odd (K+Q read per-ki from LDS)
+            (frag_S,) = gemm1_qk_unrolled_q_lds(frag_K[1], slot=1)
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
                 apply_mods(s_raw, kv_last + fx.Int32(1))
