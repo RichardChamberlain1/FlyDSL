@@ -30,11 +30,9 @@ import pytest  # noqa: E402
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 from kernels.attention.flex_attention_layout_gfx950 import (  # noqa: E402
     MASK_CAUSAL,
-    MASK_NONE,
     MASK_PREFIX_LM,
     MASK_SLIDING_WINDOW,
     SCORE_ALIBI,
-    SCORE_NONE,
     flydsl_flex_attention_layout,
     flydsl_flex_attention_layout_paged,
 )
@@ -62,7 +60,7 @@ def _sdpa_ref(q, k, v, scale, *, attn_mask=None, is_causal=False):
     return out.permute(0, 2, 1, 3).contiguous()
 
 
-def _run(B, Sq, Skv, H, D, dtype_str, *, num_groups=8, accurate_softmax=True):
+def _run(B, Sq, Skv, H, D, dtype_str, *, num_groups=8, accurate_softmax=True, pipe_depth=1):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     torch.manual_seed(0)
@@ -78,6 +76,7 @@ def _run(B, Sq, Skv, H, D, dtype_str, *, num_groups=8, accurate_softmax=True):
         scale=scale,
         num_groups=num_groups,
         accurate_softmax=accurate_softmax,
+        pipe_depth=pipe_depth,
     ).float()
     ref = _sdpa_ref(q, k, v, scale).float()
     max_err = (out - ref).abs().max().item()
@@ -389,7 +388,6 @@ def test_flex_attention_layout_causal_multi_group(num_groups):
     assert max_err < 8e-2 and cos > 0.98, f"causal groups={num_groups}: max_err={max_err} cos={cos}"
 
 
-
 _PAGED_SHAPES = [
     # (B, Sq, Skv, H, D) — Sq must be a multiple of block_m*num_groups (32*8=256)
     (1, 256, 256, 4, 128),
@@ -499,6 +497,127 @@ def test_flex_attention_layout_paged_causal(B, Sq, Skv, H, D, dtype_str):
     assert (
         max_err < 1e-1 and cos > 0.97
     ), f"paged_causal B{B} Sq{Sq} Skv{Skv} H{H} D{D} {dtype_str}: max_err={max_err} cos={cos}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8-cluster K⊥V split schedule (pipe_depth=3) tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SPLIT_KV_SHAPES = [
+    (1, 256, 256, 4, 128),
+    (1, 256, 512, 4, 128),
+    (2, 256, 256, 8, 128),
+    (1, 256, 32, 4, 128),
+    (1, 512, 1024, 4, 128),
+    (1, 256, 64, 4, 128),
+]
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
+@pytest.mark.parametrize("B,Sq,Skv,H,D", _SPLIT_KV_SHAPES)
+def test_flex_attention_layout_split_kv(B, Sq, Skv, H, D, dtype_str):
+    max_err, cos = _run(B, Sq, Skv, H, D, dtype_str, pipe_depth=3)
+    assert (
+        max_err < 8e-2 and cos > 0.98
+    ), f"split_kv B{B} Sq{Sq} Skv{Skv} H{H} D{D} {dtype_str}: max_err={max_err} cos={cos}"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("dtype_str", ["bf16", "f16"])
+@pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
+def test_flex_attention_layout_split_kv_causal(B, Sq, Skv, H, D, dtype_str):
+    dtype = _DTYPES[dtype_str]
+    dev = "cuda"
+    torch.manual_seed(0)
+    q = torch.empty(B, Sq, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    k = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    scale = 1.0 / math.sqrt(D)
+
+    out = flydsl_flex_attention_layout(
+        q,
+        k,
+        v,
+        scale=scale,
+        mask_type=MASK_CAUSAL,
+        pipe_depth=3,
+    ).float()
+    ref = _sdpa_ref(q, k, v, scale, is_causal=True).float()
+    max_err = (out - ref).abs().max().item()
+    cos = F.cosine_similarity(out.reshape(-1), ref.reshape(-1), dim=0).item()
+    assert (
+        max_err < 8e-2 and cos > 0.98
+    ), f"split_kv causal B{B} Sq{Sq} Skv{Skv} H{H} D{D} {dtype_str}: max_err={max_err} cos={cos}"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("dtype_str", ["bf16"])
+@pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
+def test_flex_attention_layout_split_kv_sliding_window(B, Sq, Skv, H, D, dtype_str):
+    dtype = _DTYPES[dtype_str]
+    dev = "cuda"
+    torch.manual_seed(0)
+    q = torch.empty(B, Sq, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    k = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    scale = 1.0 / math.sqrt(D)
+    window = 16
+
+    out = flydsl_flex_attention_layout(
+        q,
+        k,
+        v,
+        scale=scale,
+        mask_type=MASK_SLIDING_WINDOW,
+        mask_window=window,
+        pipe_depth=3,
+    ).float()
+    qi = torch.arange(Sq, device=dev).unsqueeze(1)
+    ki = torch.arange(Skv, device=dev).unsqueeze(0)
+    causal = ki <= qi
+    in_window = (qi - ki) <= window
+    mask = (causal & in_window).float().unsqueeze(0).unsqueeze(0)
+    mask = mask.masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, 0.0)
+    ref = _sdpa_ref(q, k, v, scale, attn_mask=mask).float()
+    max_err = (out - ref).abs().max().item()
+    cos = F.cosine_similarity(out.reshape(-1), ref.reshape(-1), dim=0).item()
+    assert (
+        max_err < 8e-2 and cos > 0.97
+    ), f"split_kv sw B{B} Sq{Sq} Skv{Skv} H{H} D{D} {dtype_str}: max_err={max_err} cos={cos}"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("dtype_str", ["bf16"])
+@pytest.mark.parametrize("B,Sq,Skv,H,D", _MOD_SHAPES)
+def test_flex_attention_layout_split_kv_alibi(B, Sq, Skv, H, D, dtype_str):
+    dtype = _DTYPES[dtype_str]
+    dev = "cuda"
+    torch.manual_seed(0)
+    q = torch.empty(B, Sq, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    k = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    v = torch.empty(B, Skv, H, D, dtype=dtype, device=dev).uniform_(-1, 1)
+    scale = 1.0 / math.sqrt(D)
+    slope = 0.125
+
+    out = flydsl_flex_attention_layout(
+        q,
+        k,
+        v,
+        scale=scale,
+        score_type=SCORE_ALIBI,
+        score_alibi_slope=slope,
+        pipe_depth=3,
+    ).float()
+    qi_t = torch.arange(Sq, device=dev).unsqueeze(1)
+    ki_t = torch.arange(Skv, device=dev).unsqueeze(0)
+    alibi_bias = (slope * (ki_t - qi_t)).float().unsqueeze(0).unsqueeze(0)
+    ref = _sdpa_ref(q, k, v, scale, attn_mask=alibi_bias).float()
+    max_err = (out - ref).abs().max().item()
+    cos = F.cosine_similarity(out.reshape(-1), ref.reshape(-1), dim=0).item()
+    assert (
+        max_err < 8e-2 and cos > 0.98
+    ), f"split_kv alibi B{B} Sq{Sq} Skv{Skv} H{H} D{D} {dtype_str}: max_err={max_err} cos={cos}"
 
 
 def main():

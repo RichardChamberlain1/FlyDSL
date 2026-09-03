@@ -28,8 +28,14 @@ from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from kernels.attention.flash_attn_utils import (
+    _dualwave_sync_barrier as _flash_dualwave_sync_barrier,
+    _s_nop,
+    _sched_barrier,
+    _sched_barrier_exp_pairs,
+    _sched_barrier_pairs,
     _stagger_extra_barrier_if_one,
     _stagger_extra_barrier_if_zero,
+    _waitcnt_vm_n,
 )
 
 
@@ -39,6 +45,7 @@ def pipeline_stagger_enabled(*, depth: int, num_groups: int, m_waves: int) -> bo
 
 class _InfraContext:
     stagger_i32: object = None
+
 
 try:
     from flydsl.expr.rocdl.universal import make_buffer_ptr as _make_buffer_ptr
@@ -89,6 +96,7 @@ MASK_PREFIX_LM = 3
 
 SCORE_NONE = 0
 SCORE_ALIBI = 1
+
 
 class FlexMod:
     has_mask = False
@@ -328,7 +336,9 @@ def make_flex_attn_param(
         raise ValueError("pipe_stages must be 1 or 2")
     if pipe_stages >= 2 and pipe_depth < 2:
         raise ValueError("pipe_stages=2 requires pipe_depth>=2 (decomposed pipeline)")
-    if pipe_depth >= 2 and not pipeline_stagger_enabled(
+    if pipe_depth == 3 and not (mma_m == 32 and mma_n == 32):
+        raise ValueError("pipe_depth=3 (8-cluster K⊥V split) requires 32×32 MFMA")
+    if pipe_depth >= 2 and pipe_depth != 3 and not pipeline_stagger_enabled(
         depth=pipe_depth,
         num_groups=num_groups,
         m_waves=m_waves,
@@ -610,14 +620,19 @@ def flex_attn_fwd_gfx950_kernel(
     # Q resident: load once into the GEMM1 B-fragment (reused every KV tile).
     # QK uses K=A, Q=B so C's M-rows = score indices, allowing register C→B pack for PV.
     _is_32x32 = int(param.mma_m) == 32
+    _has_score_mod = int(param.score_type) != SCORE_NONE
+    _can_prescale_q = _is_32x32 and not _has_score_mod
     tcB_q = fx.make_tiled_copy_B(ca, tiled_mma_qk).get_slice(local_tid)
     frag_Q = thr_qk.make_fragment_B(gQ)
     fx.copy(ca, tcB_q.partition_S(gQ), tcB_q.retile(frag_Q))
     if const_expr(_is_32x32):
         n_q = _size_scalar(frag_Q.shape)
-        _scale_log2e_f32 = scale * fx.Float32(_LOG2E)
+        if const_expr(_can_prescale_q):
+            _q_scale = scale * fx.Float32(_LOG2E)
+        else:
+            _q_scale = scale
         for qi in range_constexpr(n_q):
-            frag_Q[qi] = _to_elem(_to_elem(frag_Q[qi], fx.Float32) * _scale_log2e_f32, elem_dtype)
+            frag_Q[qi] = _to_elem(_to_elem(frag_Q[qi], fx.Float32) * _q_scale, elem_dtype)
 
     # Persistent O accumulator: 4 × v16f32 (one per D-chunk).
     # With V=A, P=B PV GEMM: each v16f32 has 16 D-values at 1 query-row per lane.
@@ -641,8 +656,10 @@ def flex_attn_fwd_gfx950_kernel(
     else:
         npair = n_c // 2
 
-    if const_expr(_is_32x32):
+    if const_expr(_can_prescale_q):
         scale_log2e = fx.Float32(1.0)
+    elif const_expr(_is_32x32):
+        scale_log2e = fx.Float32(_LOG2E)
     else:
         scale_log2e = scale * fx.Float32(_LOG2E)
 
@@ -866,6 +883,61 @@ def flex_attn_fwd_gfx950_kernel(
             _stage_kv_to_lds_contiguous(tile_idx, slot, True, True, ops=ops, op_offset=op_offset)
         return []
 
+    def _stage_kv_to_lds_paged_k_only(page_id, buf, ops=_dma_ops_per_thread, op_offset=0):
+        wave_off = rocdl.readfirstlane(
+            fx.Int32.ir_type, fx.Int32(tid // GFX950_WAVE_SIZE * GFX950_WAVE_SIZE * _dma_bytes)
+        )
+        _step_bytes = block_threads * _dma_bytes
+        k_global_base = page_id * fx.Int32(_page_byte_stride) + _kv_head_byte_offset
+        lds_k = fx.add_offset(sK_i8[buf], wave_off + op_offset * _step_bytes)
+        for i in range_constexpr(ops):
+            if const_expr(i > 0):
+                lds_k = fx.add_offset(lds_k, _step_bytes)
+            flat_byte = (op_offset + i) * block_threads * _dma_bytes + tid * _dma_bytes
+            tile_row = flat_byte // _k_row_bytes
+            tile_col_elem = (flat_byte % _k_row_bytes) // param.in_data_bytes
+            swiz_col = _k_swizzled_col(tile_row, tile_col_elem)
+            gmem_byte = k_global_base + tile_row * _k_row_stride_bytes + swiz_col * param.in_data_bytes
+            fx.copy(dma_atom, fx.slice(k_div, (None, fx.Int32(gmem_byte))), fx.make_view(lds_k, fx.make_layout(1, 1)))
+
+    def _stage_kv_to_lds_paged_v_only(page_id, buf, ops=_dma_ops_per_thread, op_offset=0):
+        v_global_base = page_id * fx.Int32(_page_byte_stride) + _kv_head_byte_offset
+        _v_step_bytes = _v_step_elems * param.in_data_bytes
+        for i in range_constexpr(ops):
+            flat_byte = (op_offset + i) * block_threads * _dma_bytes + tid * _dma_bytes
+            tile_row = flat_byte // _v_subtile_row_bytes
+            tile_col_byte = flat_byte % _v_subtile_row_bytes
+            dc = tile_row // block_n
+            score_row = tile_row % block_n
+            v_step = dc * 4 + score_row // 8
+            row_in_step = score_row % 8
+            lds_byte = v_step * _v_step_bytes + row_in_step * _v_subtile_row_bytes + tile_col_byte
+            lds_v = fx.add_offset(sV_i8[buf], lds_byte)
+            d_global_byte = dc * 32 * param.in_data_bytes + tile_col_byte
+            gmem_byte = fx.Int32(v_global_base) + score_row * fx.Int32(_v_row_stride_bytes) + d_global_byte
+            fx.copy(dma_atom, fx.slice(v_div, (None, fx.Int32(gmem_byte))), fx.make_view(lds_v, fx.make_layout(1, 1)))
+
+    def load_k(tile_idx, slot, ops=_dma_ops_per_thread, op_offset=0):
+        if const_expr(_paged):
+            _pid = _load_page_id(tile_idx)
+            _stage_kv_to_lds_paged_k_only(_pid, slot, ops=ops, op_offset=op_offset)
+        elif _K_HALF_BANK_SKEW_BYTES > 0:
+            _stage_kv_to_lds_strided(tile_idx, slot, 0, ops=ops, op_offset=op_offset)
+            _stage_kv_to_lds_strided(tile_idx, slot, 1, ops=ops, op_offset=op_offset)
+        else:
+            _stage_kv_to_lds_contiguous(tile_idx, slot, True, False, ops=ops, op_offset=op_offset)
+        return []
+
+    def load_v(tile_idx, slot, ops=_dma_ops_per_thread, op_offset=0):
+        if const_expr(_paged):
+            _pid = _load_page_id(tile_idx)
+            _stage_kv_to_lds_paged_v_only(_pid, slot, ops=ops, op_offset=op_offset)
+        elif _K_HALF_BANK_SKEW_BYTES > 0:
+            _stage_kv_to_lds_strided(tile_idx, slot, 2, ops=ops, op_offset=op_offset)
+        else:
+            _stage_kv_to_lds_contiguous(tile_idx, slot, False, True, ops=ops, op_offset=op_offset)
+        return []
+
     # ── V transpose read ────────────────────────────────────────────────────
     # LDS stores V as padded [block_n score, 32 D] sub-tiles per dc (D-chunk).
     # read path: LDS [score,D] ──ds_read_tr16_b64──► 4 bf16/lane ──shuffle──► v8elem MFMA A.
@@ -1081,7 +1153,7 @@ def flex_attn_fwd_gfx950_kernel(
             o_out.append((o_vec * scale_vec).ir_value())
         return o_out
 
-    _prescaled_q = const_expr(_is_32x32)
+    _prescaled_q = const_expr(_can_prescale_q)
 
     def softmax_start(frag_S_in, m_i_in):
         s_elems = [frag_S_in[i] for i in range_constexpr(n_c)]
@@ -1233,244 +1305,502 @@ def flex_attn_fwd_gfx950_kernel(
     rocdl.s_barrier()
 
     # Double-buffered KV loop via scf.for with loop-carried m/l/O state.
-    load_kv(_kv_lo, 0)
-    rocdl.s_waitcnt(0)
-    rocdl.s_barrier()
-
-    if const_expr(_enable_stagger):
-        rocdl.sched_barrier(0)
-        _stagger_extra_barrier_if_one(infra.stagger_i32)
-
-    # Unrolled-by-2 KV loop with split LDS globals for compile-time slot
-    # selection.  Each iteration does: read K/V → QK GEMM → softmax →
-    # DMA next tile → PV GEMM.  DMA and LDS reads target separate per-slot
-    # globals so LLVM can prove non-aliasing.
+    _split_kv = int(param.pipe_depth) == 3
 
     o_accs = o_accs_init
     _o = 2 * npair
 
-    def _do_tile_overlapping_softmax_prologue(kv_i32, m_i, l_i, o_accs):
-        """First pair: no deferred PV from previous. Has odd_valid/has_next guards."""
-        odd_valid = (kv_i32 + fx.Int32(1)) < _kv_hi
-        has_next = (kv_i32 + fx.Int32(2)) < _kv_hi
-        # ── Cluster 0: mem tile 0 ──
-        rocdl.s_waitcnt(vmcnt=0)
+    if const_expr(_split_kv):
+        # ════════════════════════════════════════════════════════════════════
+        # 8-cluster K⊥V schedule (pipe_depth=3).
+        # K and V never coexist in VGPRs; QK and PV in separate compute clusters.
+        # Loop carries packed P instead of V registers.
+        #
+        # Per even/odd pair (8 clusters):
+        #   C0: load_v(prev), read_k → frag_K         (memory)
+        #   C1: QK GEMM + softmax_finish on prev P    (compute)
+        #   C2: load_k(next), read_v                   (memory)
+        #   C3: PV GEMM + softmax_start                (compute)
+        #   C4-C7: mirror for odd tile
+        # ════════════════════════════════════════════════════════════════════
+
+        _kv_range = _kv_hi - _kv_lo
+        _kv_pairs = (_kv_range + fx.Int32(1)) // fx.Int32(2)
+
+        # Prologue: load K(0) → slot0, wait, barrier. Then prefetch K(1) + V(0).
+        load_k(_kv_lo, 0)
+        rocdl.s_waitcnt(0)
         rocdl.s_barrier()
+
+        if const_expr(_enable_stagger):
+            rocdl.sched_barrier(0)
+            _stagger_extra_barrier_if_one(infra.stagger_i32)
+
+        # Read K(0) into frag_K[0] and prefetch K(1) + V(0) as background DMA.
         read_k_work(0)
-        v_lo_regs_0, v_hi_regs_0 = read_v_slot[0]()
-        if odd_valid:
-            load_kv(kv_i32 + fx.Int32(1), 1)
+        load_k(_kv_lo + fx.Int32(1), 1)
+        load_v(_kv_lo, 0)
         rocdl.s_waitcnt(lgkmcnt=0)
+        _waitcnt_vm_n(int(_dma_ops_per_thread))
         dualwave_cluster_sync(0)
 
-        # ── Cluster 1: QK GEMM tile 0, no deferred PV ──
-        (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
-        s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+        # QK tile 0 — no deferred PV from previous.
+        (frag_S_pro,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+        s_raw_pro = [frag_S_pro[i] for i in range_constexpr(n_c)]
         if const_expr(mod_has_score or mod_has_mask):
-            apply_mods(s_raw, kv_i32)
-        corr_scalar_0, s_scaled_0, m_new = softmax_start(s_raw, m_i)
-        m_i_at_tile0 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
-        m_i = m_i_at_tile0
+            apply_mods(s_raw_pro, _kv_lo)
+        corr_scalar_pro, s_scaled_pro, m_new_pro = softmax_start(s_raw_pro, m_i)
+        m_i = [m_new_pro] + [m_i[r] for r in range_constexpr(1, npair)]
         dualwave_cluster_sync(1)
 
-        # ── Cluster 2: mem tile 1 ──
-        rocdl.s_waitcnt(vmcnt=0)
-        rocdl.s_barrier()
-        read_k_work(1)
-        v_lo_regs_1, v_hi_regs_1 = read_v_slot[1]()
-        if has_next:
-            load_kv(kv_i32 + fx.Int32(2), 0)
+        # Read V(0) from LDS; K(1) already in slot1 from prefetch.
+        _s_nop(7)
+        _sched_barrier(0)
+        load_k(_kv_lo + fx.Int32(2), 0)
+        v_lo_pro, v_hi_pro = read_v_slot[0]()
         rocdl.s_waitcnt(lgkmcnt=0)
+        _waitcnt_vm_n(int(_dma_ops_per_thread))
         dualwave_cluster_sync(2)
 
-        # ── Cluster 3: QK GEMM tile 1 + PV from tile 0 ──
-        (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
-        out_sm_0 = softmax_finish(s_scaled_0, m_i_at_tile0, l_i, o_accs, corr_scalar_0)
-        pv_gemm_register(out_sm_0[0], v_lo_regs_0, v_hi_regs_0, out_sm_0[3])
-        l_i, o_accs = out_sm_0[2], out_sm_0[3]
-        s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+        # PV tile 0 + softmax_finish → produces P0 for the loop carry.
+        out_sm_pro = softmax_finish(s_scaled_pro, m_i, l_i, o_accs, corr_scalar_pro)
+        pv_gemm_register(out_sm_pro[0], v_lo_pro, v_hi_pro, out_sm_pro[3])
+        l_i, o_accs = out_sm_pro[2], out_sm_pro[3]
+        dualwave_cluster_sync(3)
+
+        # Odd tile of first pair: may be invalid when _kv_pairs == 1.
+        odd_valid_pro = (_kv_lo + fx.Int32(1)) < _kv_hi
+        has_next_pro = (_kv_lo + fx.Int32(2)) < _kv_hi
+
+        # C4: read K(1) from slot1, load V(1) for odd PV
+        _s_nop(7)
+        _sched_barrier(0)
+        if odd_valid_pro:
+            load_v(_kv_lo + fx.Int32(1), 1)
+        read_k_work(1)
+        rocdl.s_waitcnt(lgkmcnt=0)
+        _waitcnt_vm_n(int(_dma_ops_per_thread))
+        dualwave_cluster_sync(4)
+
+        # C5: QK tile 1
+        (frag_S_odd,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+        s_raw_odd = [frag_S_odd[i] for i in range_constexpr(n_c)]
         if const_expr(mod_has_score or mod_has_mask):
-            apply_mods(s_raw, kv_i32 + fx.Int32(1))
+            apply_mods(s_raw_odd, _kv_lo + fx.Int32(1))
         _neg_inf = fx.Float32(-1e9)
-        s_raw = [odd_valid.select(s_raw[i], _neg_inf) for i in range_constexpr(n_c)]
-        corr_scalar_1, s_scaled_1, m_new = softmax_start(s_raw, m_i)
-        m_i_at_tile1 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
-        m_i = m_i_at_tile1
-        dualwave_cluster_sync(3)
+        s_raw_odd = [odd_valid_pro.select(s_raw_odd[i], _neg_inf) for i in range_constexpr(n_c)]
+        corr_odd, s_scaled_odd, m_new_odd = softmax_start(s_raw_odd, m_i)
+        m_i = [m_new_odd] + [m_i[r] for r in range_constexpr(1, npair)]
+        dualwave_cluster_sync(5)
 
-        return (m_i, l_i, o_accs, s_scaled_1, corr_scalar_1, v_lo_regs_1, v_hi_regs_1, m_i_at_tile1)
-
-    def _do_tile_overlapping_softmax_main(
-        kv_i32, m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev
-    ):
-        """Steady-state: always has deferred PV, always has odd tile and next."""
-        # ── Cluster 0: mem tile 0 ──
-        rocdl.s_waitcnt(vmcnt=0)
-        read_k_work(0)
-        v_lo_regs_0, v_hi_regs_0 = read_v_slot[0]()
-        load_kv(kv_i32 + fx.Int32(1), 1)
+        # C6: read V(1) for PV of odd tile
+        _s_nop(7)
+        _sched_barrier(0)
+        if has_next_pro:
+            load_k(_kv_lo + fx.Int32(3), 1)
+        v_lo_odd, v_hi_odd = read_v_slot[1]()
         rocdl.s_waitcnt(lgkmcnt=0)
-        dualwave_cluster_sync(0)
+        _waitcnt_vm_n(int(_dma_ops_per_thread))
+        dualwave_cluster_sync(6)
 
-        # ── Cluster 1: QK GEMM tile 0 + deferred PV from prev ──
-        (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
-        out_sm_prev = softmax_finish(s_scaled_prev, m_i_prev, l_i, o_accs, corr_scalar_prev)
-        pv_gemm_register(out_sm_prev[0], v_lo_prev, v_hi_prev, out_sm_prev[3])
-        l_i, o_accs = out_sm_prev[2], out_sm_prev[3]
-        s_raw = [frag_S[i] for i in range_constexpr(n_c)]
-        if const_expr(mod_has_score or mod_has_mask):
-            apply_mods(s_raw, kv_i32)
-        corr_scalar_0, s_scaled_0, m_new = softmax_start(s_raw, m_i)
-        m_i_at_tile0 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
-        m_i = m_i_at_tile0
-        dualwave_cluster_sync(1)
+        # C7: PV tile 1 + softmax_finish on odd
+        out_sm_odd = softmax_finish(s_scaled_odd, m_i, l_i, o_accs, corr_odd)
+        pv_gemm_register(out_sm_odd[0], v_lo_odd, v_hi_odd, out_sm_odd[3])
+        l_i, o_accs = out_sm_odd[2], out_sm_odd[3]
+        dualwave_cluster_sync(7)
 
-        # ── Cluster 2: mem tile 1 ──
-        rocdl.s_waitcnt(vmcnt=0)
-        read_k_work(1)
-        v_lo_regs_1, v_hi_regs_1 = read_v_slot[1]()
-        load_kv(kv_i32 + fx.Int32(2), 0)
-        rocdl.s_waitcnt(lgkmcnt=0)
-        dualwave_cluster_sync(2)
+        # ── Main loop: pairs 1 .. _kv_pairs-2 ──
+        # No V in loop carry — V is read fresh each PV cluster.
+        # No deferred PV — each tile's PV runs in the same pair.
+        _main_loop_count = _kv_pairs - fx.Int32(2)
 
-        # ── Cluster 3: QK GEMM tile 1 + PV from tile 0 ──
-        (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
-        out_sm_0 = softmax_finish(s_scaled_0, m_i_at_tile0, l_i, o_accs, corr_scalar_0)
-        pv_gemm_register(out_sm_0[0], v_lo_regs_0, v_hi_regs_0, out_sm_0[3])
-        l_i, o_accs = out_sm_0[2], out_sm_0[3]
-        s_raw = [frag_S[i] for i in range_constexpr(n_c)]
-        if const_expr(mod_has_score or mod_has_mask):
-            apply_mods(s_raw, kv_i32 + fx.Int32(1))
-        corr_scalar_1, s_scaled_1, m_new = softmax_start(s_raw, m_i)
-        m_i_at_tile1 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
-        m_i = m_i_at_tile1
-        dualwave_cluster_sync(3)
+        init3 = (
+            [m_i[r] for r in range_constexpr(npair)]
+            + [l_i[r] for r in range_constexpr(npair)]
+            + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+        )
+        loop3_results = init3
 
-        return (m_i, l_i, o_accs, s_scaled_1, corr_scalar_1, v_lo_regs_1, v_hi_regs_1, m_i_at_tile1)
+        for kv_mid, loop_args in range(
+            fx.Int32(0),
+            _main_loop_count,
+            fx.Int32(1),
+            init=init3,
+        ):
+            m_i = [loop_args[r] for r in range_constexpr(npair)]
+            l_i = [loop_args[npair + r] for r in range_constexpr(npair)]
+            o_accs = [loop_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
 
-    def _do_tile_overlapping_softmax_epilogue(
-        kv_i32, m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev
-    ):
-        """Last pair: has deferred PV, odd tile may be invalid, no next DMA."""
-        odd_valid = (kv_i32 + fx.Int32(1)) < _kv_hi
-        has_next = (kv_i32 + fx.Int32(2)) < _kv_hi
-        # ── Cluster 0: mem tile 0 ──
-        rocdl.s_waitcnt(vmcnt=0)
-        rocdl.s_barrier()
-        read_k_work(0)
-        v_lo_regs_0, v_hi_regs_0 = read_v_slot[0]()
-        if odd_valid:
-            load_kv(kv_i32 + fx.Int32(1), 1)
-        rocdl.s_waitcnt(lgkmcnt=0)
-        dualwave_cluster_sync(0)
+            kv_even = _kv_lo + (fx.Int32(arith.index_cast(T.i32, kv_mid)) + fx.Int32(1)) * fx.Int32(2)
 
-        # ── Cluster 1: QK GEMM tile 0 + deferred PV from prev ──
-        (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
-        out_sm_prev = softmax_finish(s_scaled_prev, m_i_prev, l_i, o_accs, corr_scalar_prev)
-        pv_gemm_register(out_sm_prev[0], v_lo_prev, v_hi_prev, out_sm_prev[3])
-        l_i, o_accs = out_sm_prev[2], out_sm_prev[3]
-        s_raw = [frag_S[i] for i in range_constexpr(n_c)]
-        if const_expr(mod_has_score or mod_has_mask):
-            apply_mods(s_raw, kv_i32)
-        corr_scalar_0, s_scaled_0, m_new = softmax_start(s_raw, m_i)
-        m_i_at_tile0 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
-        m_i = m_i_at_tile0
-        dualwave_cluster_sync(1)
+            # ── C0: load_v(even, slot0), read_k(slot0) ──
+            _s_nop(7)
+            _sched_barrier(0)
+            load_v(kv_even, 0)
+            read_k_work(0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            dualwave_cluster_sync(0)
 
-        # ── Cluster 2: mem tile 1 ──
-        rocdl.s_waitcnt(vmcnt=0)
-        rocdl.s_barrier()
-        read_k_work(1)
-        v_lo_regs_1, v_hi_regs_1 = read_v_slot[1]()
-        if has_next:
-            load_kv(kv_i32 + fx.Int32(2), 0)
-        rocdl.s_waitcnt(lgkmcnt=0)
-        dualwave_cluster_sync(2)
+            # ── C1: QK GEMM tile even ──
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_even)
+            corr_0, s_scaled_0, m_new = softmax_start(s_raw, m_i)
+            m_i_at_0 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            m_i = m_i_at_0
+            dualwave_cluster_sync(1)
 
-        # ── Cluster 3: QK GEMM tile 1 + PV from tile 0 ──
-        (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
-        out_sm_0 = softmax_finish(s_scaled_0, m_i_at_tile0, l_i, o_accs, corr_scalar_0)
-        pv_gemm_register(out_sm_0[0], v_lo_regs_0, v_hi_regs_0, out_sm_0[3])
-        l_i, o_accs = out_sm_0[2], out_sm_0[3]
-        s_raw = [frag_S[i] for i in range_constexpr(n_c)]
-        if const_expr(mod_has_score or mod_has_mask):
-            apply_mods(s_raw, kv_i32 + fx.Int32(1))
-        _neg_inf = fx.Float32(-1e9)
-        s_raw = [odd_valid.select(s_raw[i], _neg_inf) for i in range_constexpr(n_c)]
-        corr_scalar_1, s_scaled_1, m_new = softmax_start(s_raw, m_i)
-        m_i_at_tile1 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
-        m_i = m_i_at_tile1
-        dualwave_cluster_sync(3)
+            # ── C2: load_k(odd, slot1), read_v(slot0) ──
+            _s_nop(7)
+            _sched_barrier(0)
+            load_k(kv_even + fx.Int32(1), 1)
+            v_lo_0, v_hi_0 = read_v_slot[0]()
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            dualwave_cluster_sync(2)
 
-        return (m_i, l_i, o_accs, s_scaled_1, corr_scalar_1, v_lo_regs_1, v_hi_regs_1, m_i_at_tile1)
+            # ── C3: PV GEMM tile even ──
+            out_sm = softmax_finish(s_scaled_0, m_i_at_0, l_i, o_accs, corr_0)
+            pv_gemm_register(out_sm[0], v_lo_0, v_hi_0, out_sm[3])
+            l_i, o_accs = out_sm[2], out_sm[3]
+            dualwave_cluster_sync(3)
 
-    # Pad tile count to pairs: ceil(range / 2).  When range is odd the
-    # last pair's odd tile lands past _kv_hi — has_next=False skips the
-    # DMA, and the QK/softmax on stale LDS is harmless because the NEXT
-    # iteration (which would consume those scores) never runs.
-    # For a 1-tile range the loop executes once: even is the real tile,
-    # odd is a no-op past _kv_hi whose scores never feed a subsequent PV.
-    _kv_range = _kv_hi - _kv_lo
-    _kv_pairs = (_kv_range + fx.Int32(1)) // fx.Int32(2)
+            # ── C4: load_v(odd, slot1), read_k(slot1) ──
+            _s_nop(7)
+            _sched_barrier(0)
+            load_v(kv_even + fx.Int32(1), 1)
+            read_k_work(1)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            dualwave_cluster_sync(4)
 
-    _sm_base = _o + _n_d_chunks
-    _v_base = _sm_base + n_c + 1
-    _mi_prev_base = _v_base + 2 * _n_d_chunks
+            # ── C5: QK GEMM tile odd ──
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_even + fx.Int32(1))
+            corr_1, s_scaled_1, m_new = softmax_start(s_raw, m_i)
+            m_i_at_1 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            m_i = m_i_at_1
+            dualwave_cluster_sync(5)
 
-    # ── Prologue: first pair, no deferred PV ──
-    # Uses the dedicated prologue function which skips the deferred PV
-    # entirely. It keeps odd_valid/has_next runtime guards for edge cases
-    # (_kv_pairs==1: odd tile may be invalid, no next pair to DMA).
-    m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev = (
-        _do_tile_overlapping_softmax_prologue(_kv_lo, m_i, l_i, o_accs)
-    )
+            # ── C6: load_k(kv_even+2, slot0), read_v(slot1) ──
+            _s_nop(7)
+            _sched_barrier(0)
+            load_k(kv_even + fx.Int32(2), 0)
+            v_lo_1, v_hi_1 = read_v_slot[1]()
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            dualwave_cluster_sync(6)
 
-    # ── Main loop: pairs 1 .. _kv_pairs-2, no runtime branches ──
-    # All middle pairs have valid odd tile + guaranteed has_next.
-    _main_loop_count = _kv_pairs - fx.Int32(2)  # 0 when _kv_pairs <= 2
-    init_args = (
-        [m_i[r] for r in range_constexpr(npair)]
-        + [l_i[r] for r in range_constexpr(npair)]
-        + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
-        + [s_scaled_prev[i] for i in range_constexpr(n_c)]
-        + [corr_scalar_prev]
-        + [v_lo_prev[dc] for dc in range_constexpr(_n_d_chunks)]
-        + [v_hi_prev[dc] for dc in range_constexpr(_n_d_chunks)]
-        + [m_i_prev[r] for r in range_constexpr(npair)]
-    )
-    loop_results = init_args
+            # ── C7: PV GEMM tile odd ──
+            out_sm = softmax_finish(s_scaled_1, m_i_at_1, l_i, o_accs, corr_1)
+            pv_gemm_register(out_sm[0], v_lo_1, v_hi_1, out_sm[3])
+            l_i, o_accs = out_sm[2], out_sm[3]
+            dualwave_cluster_sync(7)
 
-    for kv_mid, loop_args in range(
-        fx.Int32(0),
-        _main_loop_count,
-        fx.Int32(1),
-        init=init_args,
-    ):
-        m_i = [loop_args[r] for r in range_constexpr(npair)]
-        l_i = [loop_args[npair + r] for r in range_constexpr(npair)]
-        o_accs = [loop_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
-        s_scaled_prev = [loop_args[_sm_base + i] for i in range_constexpr(n_c)]
-        corr_scalar_prev = loop_args[_sm_base + n_c]
-        v_lo_prev = [loop_args[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
-        v_hi_prev = [loop_args[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
-        m_i_prev = [loop_args[_mi_prev_base + r] for r in range_constexpr(npair)]
-
-        kv_even = _kv_lo + (fx.Int32(arith.index_cast(T.i32, kv_mid)) + fx.Int32(1)) * fx.Int32(2)
-        m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev = (
-            _do_tile_overlapping_softmax_main(
-                kv_even,
-                m_i,
-                l_i,
-                o_accs,
-                s_scaled_prev,
-                corr_scalar_prev,
-                v_lo_prev,
-                v_hi_prev,
-                m_i_prev,
+            loop3_results = yield (
+                [m_i[r] for r in range_constexpr(npair)]
+                + [l_i[r] for r in range_constexpr(npair)]
+                + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
             )
+
+        m_i = [loop3_results[r] for r in range_constexpr(npair)]
+        l_i = [loop3_results[npair + r] for r in range_constexpr(npair)]
+        o_accs = [loop3_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+
+        # ── Epilogue: last pair (0 or 1 times) ──
+        _epilogue_count = (_kv_pairs > fx.Int32(1)).select(fx.Int32(1), fx.Int32(0))
+        epi3_init = (
+            [m_i[r] for r in range_constexpr(npair)]
+            + [l_i[r] for r in range_constexpr(npair)]
+            + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+        )
+        epi3_results = epi3_init
+
+        for _epi_i, epi_args in range(
+            fx.Int32(0),
+            _epilogue_count,
+            fx.Int32(1),
+            init=epi3_init,
+        ):
+            m_i = [epi_args[r] for r in range_constexpr(npair)]
+            l_i = [epi_args[npair + r] for r in range_constexpr(npair)]
+            o_accs = [epi_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+
+            kv_last = _kv_lo + (_kv_pairs - fx.Int32(1)) * fx.Int32(2)
+            odd_valid = (kv_last + fx.Int32(1)) < _kv_hi
+            has_next = (kv_last + fx.Int32(2)) < _kv_hi
+
+            # C0: load V(even), read K(slot0)
+            _s_nop(7)
+            _sched_barrier(0)
+            load_v(kv_last, 0)
+            read_k_work(0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            rocdl.s_barrier()
+            dualwave_cluster_sync(0)
+
+            # C1: QK even
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_last)
+            corr_0, s_scaled_0, m_new = softmax_start(s_raw, m_i)
+            m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            dualwave_cluster_sync(1)
+
+            # C2: load K(odd) if valid, read V(slot0)
+            _s_nop(7)
+            _sched_barrier(0)
+            if odd_valid:
+                load_k(kv_last + fx.Int32(1), 1)
+            v_lo_0, v_hi_0 = read_v_slot[0]()
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _waitcnt_vm_n(int(_dma_ops_per_thread))
+            dualwave_cluster_sync(2)
+
+            # C3: PV even
+            out_sm = softmax_finish(s_scaled_0, m_i, l_i, o_accs, corr_0)
+            pv_gemm_register(out_sm[0], v_lo_0, v_hi_0, out_sm[3])
+            l_i, o_accs = out_sm[2], out_sm[3]
+            dualwave_cluster_sync(3)
+
+            # C4: load V(odd) if valid, read K(slot1)
+            _s_nop(7)
+            _sched_barrier(0)
+            if odd_valid:
+                load_v(kv_last + fx.Int32(1), 1)
+            read_k_work(1)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _waitcnt_vm_n(int(_dma_ops_per_thread))
+            rocdl.s_barrier()
+            dualwave_cluster_sync(4)
+
+            # C5: QK odd
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_last + fx.Int32(1))
+            _neg_inf = fx.Float32(-1e9)
+            s_raw = [odd_valid.select(s_raw[i], _neg_inf) for i in range_constexpr(n_c)]
+            corr_1, s_scaled_1, m_new = softmax_start(s_raw, m_i)
+            m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            dualwave_cluster_sync(5)
+
+            # C6: read V(slot1) for odd PV
+            _s_nop(7)
+            _sched_barrier(0)
+            v_lo_1, v_hi_1 = read_v_slot[1]()
+            rocdl.s_waitcnt(lgkmcnt=0)
+            dualwave_cluster_sync(6)
+
+            # C7: PV odd
+            out_sm = softmax_finish(s_scaled_1, m_i, l_i, o_accs, corr_1)
+            pv_gemm_register(out_sm[0], v_lo_1, v_hi_1, out_sm[3])
+            l_i, o_accs = out_sm[2], out_sm[3]
+            dualwave_cluster_sync(7)
+
+            epi3_results = yield (
+                [m_i[r] for r in range_constexpr(npair)]
+                + [l_i[r] for r in range_constexpr(npair)]
+                + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+            )
+
+        m_i = [epi3_results[r] for r in range_constexpr(npair)]
+        l_i = [epi3_results[npair + r] for r in range_constexpr(npair)]
+        o_accs = [epi3_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+
+        if const_expr(_enable_stagger):
+            _stagger_extra_barrier_if_zero(infra.stagger_i32)
+        rocdl.s_waitcnt(0)
+        rocdl.s_barrier()
+
+    else:
+        # ════════════════════════════════════════════════════════════════════
+        # Original 4-cluster schedule (pipe_depth=1 or 2).
+        # ════════════════════════════════════════════════════════════════════
+        load_kv(_kv_lo, 0)
+        rocdl.s_waitcnt(0)
+        rocdl.s_barrier()
+
+        if const_expr(_enable_stagger):
+            rocdl.sched_barrier(0)
+            _stagger_extra_barrier_if_one(infra.stagger_i32)
+
+        def _do_tile_overlapping_softmax_prologue(kv_i32, m_i, l_i, o_accs):
+            """First pair: no deferred PV from previous. Has odd_valid/has_next guards."""
+            odd_valid = (kv_i32 + fx.Int32(1)) < _kv_hi
+            has_next = (kv_i32 + fx.Int32(2)) < _kv_hi
+            # ── Cluster 0: mem tile 0 ──
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.s_barrier()
+            read_k_work(0)
+            v_lo_regs_0, v_hi_regs_0 = read_v_slot[0]()
+            if odd_valid:
+                load_kv(kv_i32 + fx.Int32(1), 1)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            dualwave_cluster_sync(0)
+
+            # ── Cluster 1: QK GEMM tile 0, no deferred PV ──
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_i32)
+            corr_scalar_0, s_scaled_0, m_new = softmax_start(s_raw, m_i)
+            m_i_at_tile0 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            m_i = m_i_at_tile0
+            dualwave_cluster_sync(1)
+
+            # ── Cluster 2: mem tile 1 ──
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.s_barrier()
+            read_k_work(1)
+            v_lo_regs_1, v_hi_regs_1 = read_v_slot[1]()
+            if has_next:
+                load_kv(kv_i32 + fx.Int32(2), 0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            dualwave_cluster_sync(2)
+
+            # ── Cluster 3: QK GEMM tile 1 + PV from tile 0 ──
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+            out_sm_0 = softmax_finish(s_scaled_0, m_i_at_tile0, l_i, o_accs, corr_scalar_0)
+            pv_gemm_register(out_sm_0[0], v_lo_regs_0, v_hi_regs_0, out_sm_0[3])
+            l_i, o_accs = out_sm_0[2], out_sm_0[3]
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_i32 + fx.Int32(1))
+            _neg_inf = fx.Float32(-1e9)
+            s_raw = [odd_valid.select(s_raw[i], _neg_inf) for i in range_constexpr(n_c)]
+            corr_scalar_1, s_scaled_1, m_new = softmax_start(s_raw, m_i)
+            m_i_at_tile1 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            m_i = m_i_at_tile1
+            dualwave_cluster_sync(3)
+
+            return (m_i, l_i, o_accs, s_scaled_1, corr_scalar_1, v_lo_regs_1, v_hi_regs_1, m_i_at_tile1)
+
+        def _do_tile_overlapping_softmax_main(
+            kv_i32, m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev
+        ):
+            """Steady-state: always has deferred PV, always has odd tile and next."""
+            # ── Cluster 0: mem tile 0 ──
+            rocdl.s_waitcnt(vmcnt=0)
+            read_k_work(0)
+            v_lo_regs_0, v_hi_regs_0 = read_v_slot[0]()
+            load_kv(kv_i32 + fx.Int32(1), 1)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            dualwave_cluster_sync(0)
+
+            # ── Cluster 1: QK GEMM tile 0 + deferred PV from prev ──
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+            out_sm_prev = softmax_finish(s_scaled_prev, m_i_prev, l_i, o_accs, corr_scalar_prev)
+            pv_gemm_register(out_sm_prev[0], v_lo_prev, v_hi_prev, out_sm_prev[3])
+            l_i, o_accs = out_sm_prev[2], out_sm_prev[3]
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_i32)
+            corr_scalar_0, s_scaled_0, m_new = softmax_start(s_raw, m_i)
+            m_i_at_tile0 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            m_i = m_i_at_tile0
+            dualwave_cluster_sync(1)
+
+            # ── Cluster 2: mem tile 1 ──
+            rocdl.s_waitcnt(vmcnt=0)
+            read_k_work(1)
+            v_lo_regs_1, v_hi_regs_1 = read_v_slot[1]()
+            load_kv(kv_i32 + fx.Int32(2), 0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            dualwave_cluster_sync(2)
+
+            # ── Cluster 3: QK GEMM tile 1 + PV from tile 0 ──
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+            out_sm_0 = softmax_finish(s_scaled_0, m_i_at_tile0, l_i, o_accs, corr_scalar_0)
+            pv_gemm_register(out_sm_0[0], v_lo_regs_0, v_hi_regs_0, out_sm_0[3])
+            l_i, o_accs = out_sm_0[2], out_sm_0[3]
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_i32 + fx.Int32(1))
+            corr_scalar_1, s_scaled_1, m_new = softmax_start(s_raw, m_i)
+            m_i_at_tile1 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            m_i = m_i_at_tile1
+            dualwave_cluster_sync(3)
+
+            return (m_i, l_i, o_accs, s_scaled_1, corr_scalar_1, v_lo_regs_1, v_hi_regs_1, m_i_at_tile1)
+
+        def _do_tile_overlapping_softmax_epilogue(
+            kv_i32, m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev
+        ):
+            """Last pair: has deferred PV, odd tile may be invalid, no next DMA."""
+            odd_valid = (kv_i32 + fx.Int32(1)) < _kv_hi
+            has_next = (kv_i32 + fx.Int32(2)) < _kv_hi
+            # ── Cluster 0: mem tile 0 ──
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.s_barrier()
+            read_k_work(0)
+            v_lo_regs_0, v_hi_regs_0 = read_v_slot[0]()
+            if odd_valid:
+                load_kv(kv_i32 + fx.Int32(1), 1)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            dualwave_cluster_sync(0)
+
+            # ── Cluster 1: QK GEMM tile 0 + deferred PV from prev ──
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
+            out_sm_prev = softmax_finish(s_scaled_prev, m_i_prev, l_i, o_accs, corr_scalar_prev)
+            pv_gemm_register(out_sm_prev[0], v_lo_prev, v_hi_prev, out_sm_prev[3])
+            l_i, o_accs = out_sm_prev[2], out_sm_prev[3]
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_i32)
+            corr_scalar_0, s_scaled_0, m_new = softmax_start(s_raw, m_i)
+            m_i_at_tile0 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            m_i = m_i_at_tile0
+            dualwave_cluster_sync(1)
+
+            # ── Cluster 2: mem tile 1 ──
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.s_barrier()
+            read_k_work(1)
+            v_lo_regs_1, v_hi_regs_1 = read_v_slot[1]()
+            if has_next:
+                load_kv(kv_i32 + fx.Int32(2), 0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            dualwave_cluster_sync(2)
+
+            # ── Cluster 3: QK GEMM tile 1 + PV from tile 0 ──
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
+            out_sm_0 = softmax_finish(s_scaled_0, m_i_at_tile0, l_i, o_accs, corr_scalar_0)
+            pv_gemm_register(out_sm_0[0], v_lo_regs_0, v_hi_regs_0, out_sm_0[3])
+            l_i, o_accs = out_sm_0[2], out_sm_0[3]
+            s_raw = [frag_S[i] for i in range_constexpr(n_c)]
+            if const_expr(mod_has_score or mod_has_mask):
+                apply_mods(s_raw, kv_i32 + fx.Int32(1))
+            _neg_inf = fx.Float32(-1e9)
+            s_raw = [odd_valid.select(s_raw[i], _neg_inf) for i in range_constexpr(n_c)]
+            corr_scalar_1, s_scaled_1, m_new = softmax_start(s_raw, m_i)
+            m_i_at_tile1 = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            m_i = m_i_at_tile1
+            dualwave_cluster_sync(3)
+
+            return (m_i, l_i, o_accs, s_scaled_1, corr_scalar_1, v_lo_regs_1, v_hi_regs_1, m_i_at_tile1)
+
+        _kv_range = _kv_hi - _kv_lo
+        _kv_pairs = (_kv_range + fx.Int32(1)) // fx.Int32(2)
+
+        _sm_base = _o + _n_d_chunks
+        _v_base = _sm_base + n_c + 1
+        _mi_prev_base = _v_base + 2 * _n_d_chunks
+
+        # ── Prologue: first pair, no deferred PV ──
+        m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev = (
+            _do_tile_overlapping_softmax_prologue(_kv_lo, m_i, l_i, o_accs)
         )
 
-        loop_results = yield (
+        # ── Main loop: pairs 1 .. _kv_pairs-2, no runtime branches ──
+        _main_loop_count = _kv_pairs - fx.Int32(2)
+        init_args = (
             [m_i[r] for r in range_constexpr(npair)]
             + [l_i[r] for r in range_constexpr(npair)]
             + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
@@ -1480,63 +1810,61 @@ def flex_attn_fwd_gfx950_kernel(
             + [v_hi_prev[dc] for dc in range_constexpr(_n_d_chunks)]
             + [m_i_prev[r] for r in range_constexpr(npair)]
         )
+        loop_results = init_args
 
-    m_i = [loop_results[r] for r in range_constexpr(npair)]
-    l_i = [loop_results[npair + r] for r in range_constexpr(npair)]
-    o_accs = [loop_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
-    s_scaled_prev = [loop_results[_sm_base + i] for i in range_constexpr(n_c)]
-    corr_scalar_prev = loop_results[_sm_base + n_c]
-    v_lo_prev = [loop_results[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
-    v_hi_prev = [loop_results[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
-    m_i_prev = [loop_results[_mi_prev_base + r] for r in range_constexpr(npair)]
+        for kv_mid, loop_args in range(
+            fx.Int32(0),
+            _main_loop_count,
+            fx.Int32(1),
+            init=init_args,
+        ):
+            m_i = [loop_args[r] for r in range_constexpr(npair)]
+            l_i = [loop_args[npair + r] for r in range_constexpr(npair)]
+            o_accs = [loop_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+            s_scaled_prev = [loop_args[_sm_base + i] for i in range_constexpr(n_c)]
+            corr_scalar_prev = loop_args[_sm_base + n_c]
+            v_lo_prev = [loop_args[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
+            v_hi_prev = [loop_args[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
+            m_i_prev = [loop_args[_mi_prev_base + r] for r in range_constexpr(npair)]
 
-    # ── Epilogue: last pair (runs 0 or 1 times), has odd_valid/has_next guards ──
-    # Uses scf.for with trip count min(_kv_pairs-1, 1) to avoid scf.if dominance issues.
-    # When _kv_pairs==1, prologue handled the only pair; skip straight to final PV.
-    _epilogue_count = (_kv_pairs > fx.Int32(1)).select(fx.Int32(1), fx.Int32(0))
-    epi_init = (
-        [m_i[r] for r in range_constexpr(npair)]
-        + [l_i[r] for r in range_constexpr(npair)]
-        + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
-        + [s_scaled_prev[i] for i in range_constexpr(n_c)]
-        + [corr_scalar_prev]
-        + [v_lo_prev[dc] for dc in range_constexpr(_n_d_chunks)]
-        + [v_hi_prev[dc] for dc in range_constexpr(_n_d_chunks)]
-        + [m_i_prev[r] for r in range_constexpr(npair)]
-    )
-    epi_results = epi_init
-
-    for _epi_i, epi_args in range(
-        fx.Int32(0),
-        _epilogue_count,
-        fx.Int32(1),
-        init=epi_init,
-    ):
-        m_i = [epi_args[r] for r in range_constexpr(npair)]
-        l_i = [epi_args[npair + r] for r in range_constexpr(npair)]
-        o_accs = [epi_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
-        s_scaled_prev = [epi_args[_sm_base + i] for i in range_constexpr(n_c)]
-        corr_scalar_prev = epi_args[_sm_base + n_c]
-        v_lo_prev = [epi_args[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
-        v_hi_prev = [epi_args[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
-        m_i_prev = [epi_args[_mi_prev_base + r] for r in range_constexpr(npair)]
-
-        kv_last = _kv_lo + (_kv_pairs - fx.Int32(1)) * fx.Int32(2)
-        m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev = (
-            _do_tile_overlapping_softmax_epilogue(
-                kv_last,
-                m_i,
-                l_i,
-                o_accs,
-                s_scaled_prev,
-                corr_scalar_prev,
-                v_lo_prev,
-                v_hi_prev,
-                m_i_prev,
+            kv_even = _kv_lo + (fx.Int32(arith.index_cast(T.i32, kv_mid)) + fx.Int32(1)) * fx.Int32(2)
+            m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev = (
+                _do_tile_overlapping_softmax_main(
+                    kv_even,
+                    m_i,
+                    l_i,
+                    o_accs,
+                    s_scaled_prev,
+                    corr_scalar_prev,
+                    v_lo_prev,
+                    v_hi_prev,
+                    m_i_prev,
+                )
             )
-        )
 
-        epi_results = yield (
+            loop_results = yield (
+                [m_i[r] for r in range_constexpr(npair)]
+                + [l_i[r] for r in range_constexpr(npair)]
+                + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+                + [s_scaled_prev[i] for i in range_constexpr(n_c)]
+                + [corr_scalar_prev]
+                + [v_lo_prev[dc] for dc in range_constexpr(_n_d_chunks)]
+                + [v_hi_prev[dc] for dc in range_constexpr(_n_d_chunks)]
+                + [m_i_prev[r] for r in range_constexpr(npair)]
+            )
+
+        m_i = [loop_results[r] for r in range_constexpr(npair)]
+        l_i = [loop_results[npair + r] for r in range_constexpr(npair)]
+        o_accs = [loop_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+        s_scaled_prev = [loop_results[_sm_base + i] for i in range_constexpr(n_c)]
+        corr_scalar_prev = loop_results[_sm_base + n_c]
+        v_lo_prev = [loop_results[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
+        v_hi_prev = [loop_results[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
+        m_i_prev = [loop_results[_mi_prev_base + r] for r in range_constexpr(npair)]
+
+        # ── Epilogue: last pair (runs 0 or 1 times) ──
+        _epilogue_count = (_kv_pairs > fx.Int32(1)).select(fx.Int32(1), fx.Int32(0))
+        epi_init = (
             [m_i[r] for r in range_constexpr(npair)]
             + [l_i[r] for r in range_constexpr(npair)]
             + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
@@ -1546,25 +1874,67 @@ def flex_attn_fwd_gfx950_kernel(
             + [v_hi_prev[dc] for dc in range_constexpr(_n_d_chunks)]
             + [m_i_prev[r] for r in range_constexpr(npair)]
         )
+        epi_results = epi_init
 
-    m_i = [epi_results[r] for r in range_constexpr(npair)]
-    l_i = [epi_results[npair + r] for r in range_constexpr(npair)]
-    o_accs = [epi_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
-    s_scaled_prev = [epi_results[_sm_base + i] for i in range_constexpr(n_c)]
-    corr_scalar_prev = epi_results[_sm_base + n_c]
-    v_lo_prev = [epi_results[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
-    v_hi_prev = [epi_results[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
-    m_i_prev = [epi_results[_mi_prev_base + r] for r in range_constexpr(npair)]
+        for _epi_i, epi_args in range(
+            fx.Int32(0),
+            _epilogue_count,
+            fx.Int32(1),
+            init=epi_init,
+        ):
+            m_i = [epi_args[r] for r in range_constexpr(npair)]
+            l_i = [epi_args[npair + r] for r in range_constexpr(npair)]
+            o_accs = [epi_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+            s_scaled_prev = [epi_args[_sm_base + i] for i in range_constexpr(n_c)]
+            corr_scalar_prev = epi_args[_sm_base + n_c]
+            v_lo_prev = [epi_args[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
+            v_hi_prev = [epi_args[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
+            m_i_prev = [epi_args[_mi_prev_base + r] for r in range_constexpr(npair)]
 
-    # Final deferred PV from the last tile
-    out_sm_final = softmax_finish(s_scaled_prev, m_i_prev, l_i, o_accs, corr_scalar_prev)
-    pv_gemm_register(out_sm_final[0], v_lo_prev, v_hi_prev, out_sm_final[3])
-    l_i, o_accs = out_sm_final[2], out_sm_final[3]
+            kv_last = _kv_lo + (_kv_pairs - fx.Int32(1)) * fx.Int32(2)
+            m_i, l_i, o_accs, s_scaled_prev, corr_scalar_prev, v_lo_prev, v_hi_prev, m_i_prev = (
+                _do_tile_overlapping_softmax_epilogue(
+                    kv_last,
+                    m_i,
+                    l_i,
+                    o_accs,
+                    s_scaled_prev,
+                    corr_scalar_prev,
+                    v_lo_prev,
+                    v_hi_prev,
+                    m_i_prev,
+                )
+            )
 
-    if const_expr(_enable_stagger):
-        _stagger_extra_barrier_if_zero(infra.stagger_i32)
-    rocdl.s_waitcnt(0)
-    rocdl.s_barrier()
+            epi_results = yield (
+                [m_i[r] for r in range_constexpr(npair)]
+                + [l_i[r] for r in range_constexpr(npair)]
+                + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+                + [s_scaled_prev[i] for i in range_constexpr(n_c)]
+                + [corr_scalar_prev]
+                + [v_lo_prev[dc] for dc in range_constexpr(_n_d_chunks)]
+                + [v_hi_prev[dc] for dc in range_constexpr(_n_d_chunks)]
+                + [m_i_prev[r] for r in range_constexpr(npair)]
+            )
+
+        m_i = [epi_results[r] for r in range_constexpr(npair)]
+        l_i = [epi_results[npair + r] for r in range_constexpr(npair)]
+        o_accs = [epi_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+        s_scaled_prev = [epi_results[_sm_base + i] for i in range_constexpr(n_c)]
+        corr_scalar_prev = epi_results[_sm_base + n_c]
+        v_lo_prev = [epi_results[_v_base + dc] for dc in range_constexpr(_n_d_chunks)]
+        v_hi_prev = [epi_results[_v_base + _n_d_chunks + dc] for dc in range_constexpr(_n_d_chunks)]
+        m_i_prev = [epi_results[_mi_prev_base + r] for r in range_constexpr(npair)]
+
+        # Final deferred PV from the last tile
+        out_sm_final = softmax_finish(s_scaled_prev, m_i_prev, l_i, o_accs, corr_scalar_prev)
+        pv_gemm_register(out_sm_final[0], v_lo_prev, v_hi_prev, out_sm_final[3])
+        l_i, o_accs = out_sm_final[2], out_sm_final[3]
+
+        if const_expr(_enable_stagger):
+            _stagger_extra_barrier_if_zero(infra.stagger_i32)
+        rocdl.s_waitcnt(0)
+        rocdl.s_barrier()
 
     # After QK swap with npair=1: l_i[0] already has the correct per-query-row sum
     # (permlane32 in softmax combines the two score halves). No shuffle_xor needed.
@@ -2088,7 +2458,6 @@ def flydsl_flex_attention_layout_paged(
 
 
 FLEX_DTYPE_FP8 = 4  # stub for test imports
-
 
 def flydsl_flex_attention_layout_fp8(*args, **kwargs):
     raise NotImplementedError("FP8 flex attention is not supported in this build")
