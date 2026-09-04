@@ -5609,6 +5609,54 @@ def _stagger_extra_barrier_if_one(stagger_i32):
         rocdl.s_barrier()
 
 
+def _stagger_extra_barriers_open(stagger_i32):
+    """Emit ``stagger_i32`` barriers (0-3) for 4-group stagger open."""
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"),
+        [stagger_i32],
+        (
+            "s_cmp_ge_u32 $0, 1\n\t"
+            "s_cbranch_scc0 100f\n\t"
+            "s_barrier\n"
+            "100:\n\t"
+            "s_cmp_ge_u32 $0, 2\n\t"
+            "s_cbranch_scc0 101f\n\t"
+            "s_barrier\n"
+            "101:\n\t"
+            "s_cmp_ge_u32 $0, 3\n\t"
+            "s_cbranch_scc0 102f\n\t"
+            "s_barrier\n"
+            "102:"
+        ),
+        "s",
+        has_side_effects=True,
+    )
+
+
+def _stagger_extra_barriers_close(stagger_i32):
+    """Emit ``3 - stagger_i32`` barriers for 4-group stagger close."""
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"),
+        [stagger_i32],
+        (
+            "s_cmp_le_u32 $0, 2\n\t"
+            "s_cbranch_scc0 200f\n\t"
+            "s_barrier\n"
+            "200:\n\t"
+            "s_cmp_le_u32 $0, 1\n\t"
+            "s_cbranch_scc0 201f\n\t"
+            "s_barrier\n"
+            "201:\n\t"
+            "s_cmp_eq_u32 $0, 0\n\t"
+            "s_cbranch_scc0 202f\n\t"
+            "s_barrier\n"
+            "202:"
+        ),
+        "s",
+        has_side_effects=True,
+    )
+
+
 def _debug_atomic_inc_lazy_count(byte_offset, debug_counts_rsrc):
     rocdl.raw_buffer_atomic(as_mlir_value(fx.Float32(1.0))) + debug_counts_rsrc
 
