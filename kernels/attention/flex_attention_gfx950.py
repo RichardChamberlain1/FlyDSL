@@ -2029,7 +2029,9 @@ def flex_attn_fwd_gfx950_kernel(
     # C fragment layout (M=D, N=query): lane L has query_row = L%32.
     # Elements [4k..4k+3] map to 4 contiguous D columns at offset 8k,
     # so each group of 4 can be stored as one 64-bit buffer store.
+    # Guard: skip OOB rows when Sq is not divisible by num_groups*block_m.
     _qrow = fx.Int32(local_tid % 32)
+    _q_row_global = fx.Int32(arith.index_cast(T.i32, q_start)) + _qrow
     _group_d_base = fx.Int32((local_tid // 32) * 4)
     _o_row_stride = hq * head_dim
     _out_elem_dtype = elem_dtype
@@ -2366,10 +2368,7 @@ def flydsl_flex_attention(
     Skv, Hkv = k.shape[1], k.shape[2]
     if num_kv_heads is not None and num_kv_heads != Hkv:
         raise ValueError(f"num_kv_heads {num_kv_heads} != k head count {Hkv}")
-    # Auto-select num_groups: largest value <= requested that divides Sq/block_m.
-    _q_tiles = Sq // block_m
-    while num_groups > 1 and _q_tiles % num_groups != 0:
-        num_groups -= 1
+    # Grid rounds up — OOB groups skip via bounded buffer descriptors.
     rows_per_wg = block_m * num_groups
     if scale is None:
         scale = 1.0 / (D**0.5)
