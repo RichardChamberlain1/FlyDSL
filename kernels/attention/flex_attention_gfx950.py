@@ -1410,7 +1410,7 @@ def flex_attn_fwd_gfx950_kernel(
         if const_expr(_is_32x32):
             _total_waves = int(param.block_threads) // GFX950_WAVE_SIZE
             if const_expr(int(param.pipe_depth) == 3):
-                _stagger_div = max(1, _total_waves // 4)
+                _stagger_div = max(1, _total_waves // 3)
             else:
                 _stagger_div = _flex_stagger_divisor(int(param.block_threads))
             _wave_id = fx.Int32(tid // GFX950_WAVE_SIZE)
@@ -1504,11 +1504,9 @@ def flex_attn_fwd_gfx950_kernel(
 
         _kv_range = _kv_hi - _kv_lo
 
-        # Initialize o_accs[2:3] in LDS (zeros)
-        store_o_lds(o_accs)
-        rocdl.s_waitcnt(lgkmcnt=0)
-
         # ── Prologue: tile 0 ──
+        # 6-cluster schedule, GEMMs at C1 and C4 (3 apart).
+        # Full o_accs in loop carry (168 VGPRs budget).
         load_k(_kv_lo, 0)
         rocdl.s_waitcnt(0)
         rocdl.s_barrier()
@@ -1517,12 +1515,11 @@ def flex_attn_fwd_gfx950_kernel(
             rocdl.sched_barrier(0)
             _stagger_extra_barriers_open(infra.stagger_i32)
 
-        # C0: load V[0] DMA (K stays in LDS, read per-ki in C1)
+        # C0: V DMA
         load_v(_kv_lo, 0)
-        _waitcnt_vm_n(int(_dma_ops_per_thread))
         dualwave_cluster_sync(0)
 
-        # C1: QK GEMM (Q in registers, K read per-ki from LDS) + softmax_start
+        # C1: QK GEMM + softmax_start  [GEMM]
         (frag_S_pro,) = gemm1_qk_k_from_lds(frag_Q, slot=0)
         s_raw_pro = [frag_S_pro[i] for i in range_constexpr(n_c)]
         if const_expr(mod_has_score or mod_has_mask):
@@ -1531,61 +1528,40 @@ def flex_attn_fwd_gfx950_kernel(
         m_i = [m_new_pro] + [m_i[r] for r in range_constexpr(1, npair)]
         dualwave_cluster_sync(1)
 
-        # C2: softmax_p (P + l_new, NO o_accs) + K DMA
+        # C2: softmax_finish + K DMA + V barrier
         _has_tile1 = (_kv_lo + fx.Int32(1)) < _kv_hi
         if _has_tile1:
             load_k(_kv_lo + fx.Int32(1), 0)
-        p_elems_pro, l_i = softmax_p(s_scaled_pro, m_i, l_i, corr_pro)
-        p_lo_pro, p_hi_pro = _pack_p_b(p_elems_pro)
-        dualwave_cluster_sync(2)
-
-        # C3: V DMA wait + read V[0:1]
-        _s_nop(7)
-        _sched_barrier(0)
-        rocdl.s_waitcnt(0)
-        rocdl.s_barrier()
-        v_lo_01_pro, v_hi_01_pro = read_v_lo_half()
-        rocdl.s_waitcnt(lgkmcnt=0)
-        dualwave_cluster_sync(3)
-
-        # C4: rescale o_accs[0:1] + PV GEMM chunks 0,1 (V[0:1] dies)
-        for dc in range_constexpr(2):
-            o_accs[dc] = _scale_o_chunk(o_accs[dc], corr_pro)
-            o_accs[dc] = _mfma_acc(v_lo_01_pro[dc], p_lo_pro, o_accs[dc], _pv_mma_atom)
-            o_accs[dc] = _mfma_acc(v_hi_01_pro[dc], p_hi_pro, o_accs[dc], _pv_mma_atom)
-        dualwave_cluster_sync(4)
-
-        # C5: read V[2:3] + load o_lds, rescale, PV GEMM, store back
-        v_lo_23_pro, v_hi_23_pro = read_v_hi_half()
-        _o_lds_pro = load_o_lds()
-        rocdl.s_waitcnt(lgkmcnt=0)
-        for dc in range_constexpr(2):
-            _o_lds_pro[dc] = _scale_o_chunk(_o_lds_pro[dc], corr_pro)
-            _o_lds_pro[dc] = _mfma_acc(v_lo_23_pro[dc], p_lo_pro, _o_lds_pro[dc], _pv_mma_atom)
-            _o_lds_pro[dc] = _mfma_acc(v_hi_23_pro[dc], p_hi_pro, _o_lds_pro[dc], _pv_mma_atom)
-        store_o_lds([None, None, _o_lds_pro[0], _o_lds_pro[1]])
-        rocdl.s_waitcnt(lgkmcnt=0)
-        dualwave_cluster_sync(5)
-
-        # C6: K DMA wait + barrier
+        out_sm_pro = softmax_finish(s_scaled_pro, m_i, l_i, o_accs, corr_pro)
         _waitcnt_vm_n(int(_dma_ops_per_thread))
         rocdl.s_waitcnt(0)
         rocdl.s_barrier()
-        dualwave_cluster_sync(6)
+        dualwave_cluster_sync(2)
 
-        # C7: sync
-        dualwave_cluster_sync(7)
+        # C3: V read
+        v_lo_pro, v_hi_pro = read_v_slot[0]()
+        rocdl.s_waitcnt(lgkmcnt=0)
+        dualwave_cluster_sync(3)
+
+        # C4: PV GEMM  [GEMM, 3 from C1]
+        pv_gemm_register(out_sm_pro[0], v_lo_pro, v_hi_pro, out_sm_pro[3])
+        l_i, o_accs = out_sm_pro[2], out_sm_pro[3]
+        dualwave_cluster_sync(4)
+
+        # C5: K DMA barrier
+        _waitcnt_vm_n(int(_dma_ops_per_thread))
+        rocdl.s_waitcnt(0)
+        rocdl.s_barrier()
+        dualwave_cluster_sync(5)
 
         # ── Main loop: tiles 1 .. N-2 ──
-        # o_accs[0:1] in loop carry (32 VGPRs). o_accs[2:3] in LDS only.
+        # Full o_accs (all 4 chunks) in loop carry.
         _main_loop_count = _kv_range - fx.Int32(2)
-        _n_o_reg = 2  # D-chunks carried in registers
-        _o_reg = 2 * npair  # offset in loop carry
 
         init3 = (
             [m_i[r] for r in range_constexpr(npair)]
             + [l_i[r] for r in range_constexpr(npair)]
-            + [o_accs[dc] for dc in range_constexpr(_n_o_reg)]
+            + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
         )
         loop3_results = init3
 
@@ -1597,18 +1573,15 @@ def flex_attn_fwd_gfx950_kernel(
         ):
             m_i = [loop_args[r] for r in range_constexpr(npair)]
             l_i = [loop_args[npair + r] for r in range_constexpr(npair)]
-            o_reg = [loop_args[_o_reg + dc] for dc in range_constexpr(_n_o_reg)]
+            o_accs = [loop_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
 
             tile_idx = _kv_lo + fx.Int32(arith.index_cast(T.i32, kv_mid)) + fx.Int32(1)
 
-            # C0: load V DMA (K stays in LDS, read per-ki in C1)
-            _s_nop(7)
-            _sched_barrier(0)
+            # C0: V DMA
             load_v(tile_idx, 0)
-            _waitcnt_vm_n(int(_dma_ops_per_thread))
             dualwave_cluster_sync(0)
 
-            # C1: QK GEMM (Q in registers, K per-ki from LDS) + softmax_start
+            # C1: QK GEMM + softmax_start  [GEMM]
             (frag_S,) = gemm1_qk_k_from_lds(frag_Q, slot=0)
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
@@ -1617,66 +1590,41 @@ def flex_attn_fwd_gfx950_kernel(
             m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
             dualwave_cluster_sync(1)
 
-            # C2: softmax_p (P + l_new, NO o_accs touched) + K DMA
+            # C2: softmax_finish + K DMA + V barrier
             load_k(tile_idx + fx.Int32(1), 0)
-            p_elems, l_i = softmax_p(s_scaled, m_i, l_i, corr)
-            p_lo, p_hi = _pack_p_b(p_elems)
-            dualwave_cluster_sync(2)
-
-            # C3: V DMA wait + read V[0:1] only (D-chunks 0,1)
-            _s_nop(7)
-            _sched_barrier(0)
-            rocdl.s_waitcnt(0)
-            rocdl.s_barrier()
-            v_lo_01, v_hi_01 = read_v_lo_half()
-            rocdl.s_waitcnt(lgkmcnt=0)
-            dualwave_cluster_sync(3)
-
-            # C4: rescale o_reg[0:1] + PV GEMM chunks 0,1 (V[0:1] dies here)
-            for dc in range_constexpr(_n_o_reg):
-                o_reg[dc] = _scale_o_chunk(o_reg[dc], corr)
-                o_reg[dc] = _mfma_acc(v_lo_01[dc], p_lo, o_reg[dc], _pv_mma_atom)
-                o_reg[dc] = _mfma_acc(v_hi_01[dc], p_hi, o_reg[dc], _pv_mma_atom)
-            dualwave_cluster_sync(4)
-
-            # C5: read V[2:3] + load o_lds, rescale, PV GEMM, store back
-            v_lo_23, v_hi_23 = read_v_hi_half()
-            _o_lds = load_o_lds()
-            rocdl.s_waitcnt(lgkmcnt=0)
-            for dc in range_constexpr(2):
-                _o_lds[dc] = _scale_o_chunk(_o_lds[dc], corr)
-                _o_lds[dc] = _mfma_acc(v_lo_23[dc], p_lo, _o_lds[dc], _pv_mma_atom)
-                _o_lds[dc] = _mfma_acc(v_hi_23[dc], p_hi, _o_lds[dc], _pv_mma_atom)
-            store_o_lds([None, None, _o_lds[0], _o_lds[1]])
-            rocdl.s_waitcnt(lgkmcnt=0)
-            dualwave_cluster_sync(5)
-
-            # C6: K DMA wait + barrier
+            out_sm = softmax_finish(s_scaled, m_i, l_i, o_accs, corr)
             _waitcnt_vm_n(int(_dma_ops_per_thread))
             rocdl.s_waitcnt(0)
             rocdl.s_barrier()
-            dualwave_cluster_sync(6)
+            dualwave_cluster_sync(2)
 
-            # C7: sync
-            dualwave_cluster_sync(7)
+            # C3: V read
+            v_lo, v_hi = read_v_slot[0]()
+            rocdl.s_waitcnt(lgkmcnt=0)
+            dualwave_cluster_sync(3)
 
-            # Only o_accs[0:1] in yield — [2:3] stay in LDS
+            # C4: PV GEMM  [GEMM, 3 from C1]
+            pv_gemm_register(out_sm[0], v_lo, v_hi, out_sm[3])
+            l_i, o_accs = out_sm[2], out_sm[3]
+            dualwave_cluster_sync(4)
+
+            # C5: K DMA barrier
+            _waitcnt_vm_n(int(_dma_ops_per_thread))
+            rocdl.s_waitcnt(0)
+            rocdl.s_barrier()
+            dualwave_cluster_sync(5)
+
             loop3_results = yield (
                 [m_i[r] for r in range_constexpr(npair)]
                 + [l_i[r] for r in range_constexpr(npair)]
-                + [o_reg[dc] for dc in range_constexpr(_n_o_reg)]
+                + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
             )
 
         m_i = [loop3_results[r] for r in range_constexpr(npair)]
         l_i = [loop3_results[npair + r] for r in range_constexpr(npair)]
-        o_accs = [loop3_results[_o_reg + dc] for dc in range_constexpr(_n_o_reg)]
+        o_accs = [loop3_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
 
         # ── Epilogue: last tile (0 or 1 times) ──
-        # Reload o_accs[2:3] from LDS for epilogue (which yields all 4).
-        _o_lds_epi = load_o_lds()
-        rocdl.s_waitcnt(lgkmcnt=0)
-        o_accs = o_accs + [_o_lds_epi[0], _o_lds_epi[1]]
-
         _epilogue_count = (_kv_range > fx.Int32(1)).select(fx.Int32(1), fx.Int32(0))
         epi3_init = (
             [m_i[r] for r in range_constexpr(npair)]
@@ -1697,15 +1645,14 @@ def flex_attn_fwd_gfx950_kernel(
 
             _last_tile = _kv_hi - fx.Int32(1)
 
-            # C0: load V DMA (K stays in LDS, read per-ki in C1)
-            _s_nop(7)
-            _sched_barrier(0)
+            # C0: V DMA + V barrier (last tile, K already in LDS)
             load_v(_last_tile, 0)
             _waitcnt_vm_n(int(_dma_ops_per_thread))
+            rocdl.s_waitcnt(0)
             rocdl.s_barrier()
             dualwave_cluster_sync(0)
 
-            # C1: QK GEMM (Q in registers, K per-ki from LDS) + softmax_start
+            # C1: QK GEMM + softmax_start  [GEMM]
             (frag_S,) = gemm1_qk_k_from_lds(frag_Q, slot=0)
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
@@ -1714,28 +1661,22 @@ def flex_attn_fwd_gfx950_kernel(
             m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
             dualwave_cluster_sync(1)
 
-            # C2: softmax_finish (all 4 o_accs in registers)
+            # C2: softmax_finish
             out_sm = softmax_finish(s_scaled, m_i, l_i, o_accs, corr)
             dualwave_cluster_sync(2)
 
-            # C3: V DMA wait + read V
-            _s_nop(7)
-            _sched_barrier(0)
-            rocdl.s_waitcnt(0)
-            rocdl.s_barrier()
+            # C3: V read
             v_lo, v_hi = read_v_slot[0]()
             rocdl.s_waitcnt(lgkmcnt=0)
             dualwave_cluster_sync(3)
 
-            # C4: PV GEMM
+            # C4: PV GEMM  [GEMM, 3 from C1]
             pv_gemm_register(out_sm[0], v_lo, v_hi, out_sm[3])
             l_i, o_accs = out_sm[2], out_sm[3]
             dualwave_cluster_sync(4)
 
-            # C5-C7: no next tile
+            # C5: sync
             dualwave_cluster_sync(5)
-            dualwave_cluster_sync(6)
-            dualwave_cluster_sync(7)
 
             epi3_results = yield (
                 [m_i[r] for r in range_constexpr(npair)]
@@ -2362,7 +2303,8 @@ def launch_flex_attn_gfx950(
 
 # fast_fp_math breaks pipe_depth=2 when seqlen_kv == block_n (single KV tile); omit it.
 _flex_attn_compile_hints = {
-    "waves_per_eu": 2,
+    "waves_per_eu": 3,
+    "maxnreg": 168,
     "unsafe_fp_math": True,
     "llvm_options": {
         "enable-post-misched": False,

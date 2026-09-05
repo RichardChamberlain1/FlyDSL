@@ -1,20 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep *)",
-      "Bash(python3 *)",
-      "Bash(ls *)",
-      "Bash(find *)",
-      "Bash(wc *)",
-      "Bash(head *)",
-      "Bash(tail *)",
-      "Bash(cat *)",
-      "Bash(bash *)",
-      "Bash(git *)",
-      "Bash(rm *)",
-      "Bash(cp *)",
-      "Bash(cd *)",
-      "Bash(mkdir *)",
+      "Bash(*)",
       "Read",
       "Write",
       "Edit",
@@ -25,12 +12,8 @@
       "TaskUpdate",
       "TaskList",
       "TaskGet",
-      "Bash(diff *)",
-      "Bash(sort *)",
-      "Bash(awk *)",
-      "Bash(sed *)",
-      "Bash(echo *)",
-      "Bash(export *)"
+      "Workflow",
+      "Skill"
     ]
   }
 }
