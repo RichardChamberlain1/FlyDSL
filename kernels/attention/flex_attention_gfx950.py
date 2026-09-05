@@ -2324,8 +2324,8 @@ def flydsl_flex_attention(
     out: Optional[torch.Tensor] = None,
     block_m: int = 32,
     block_n: int = 32,
-    num_groups: int = 8,
-    pipe_depth: int = 1,
+    num_groups: int = 12,
+    pipe_depth: int = 3,
     pipe_stages: int = 1,
     accurate_softmax: bool = True,
     mask_type: int = MASK_NONE,
@@ -2366,9 +2366,11 @@ def flydsl_flex_attention(
     Skv, Hkv = k.shape[1], k.shape[2]
     if num_kv_heads is not None and num_kv_heads != Hkv:
         raise ValueError(f"num_kv_heads {num_kv_heads} != k head count {Hkv}")
+    # Auto-select num_groups: largest value <= requested that divides Sq/block_m.
+    _q_tiles = Sq // block_m
+    while num_groups > 1 and _q_tiles % num_groups != 0:
+        num_groups -= 1
     rows_per_wg = block_m * num_groups
-    if Sq % rows_per_wg != 0:
-        raise ValueError(f"seqlen_q ({Sq}) must be a multiple of block_m*num_groups ({rows_per_wg})")
     if scale is None:
         scale = 1.0 / (D**0.5)
 

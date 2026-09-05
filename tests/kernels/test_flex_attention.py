@@ -60,7 +60,7 @@ def _sdpa_ref(q, k, v, scale, *, attn_mask=None, is_causal=False):
     return out.permute(0, 2, 1, 3).contiguous()
 
 
-def _run(B, Sq, Skv, H, D, dtype_str, *, num_groups=8, accurate_softmax=True, pipe_depth=1):
+def _run(B, Sq, Skv, H, D, dtype_str, *, num_groups=12, accurate_softmax=True, pipe_depth=3):
     dtype = _DTYPES[dtype_str]
     dev = "cuda"
     torch.manual_seed(0)
