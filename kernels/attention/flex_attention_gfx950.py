@@ -1605,9 +1605,9 @@ def flex_attn_fwd_gfx950_kernel(
             read_k_all(slot=0)
             dualwave_cluster_sync(0)
 
-            # C1: O rescale(prev_corr, overlaps QK GEMM) + QK GEMM + softmax_start
+            # C1: O rescale(prev_corr) + QK GEMM + softmax_start
+            # No s_waitcnt needed — K reads issued in C0 completed during barrier.
             o_accs = _scale_o_vec(o_accs, prev_corr)
-            rocdl.s_waitcnt(lgkmcnt=0)
             (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
