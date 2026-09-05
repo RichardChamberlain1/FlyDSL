@@ -1336,6 +1336,19 @@ def flex_attn_fwd_gfx950_kernel(
         o_accs_out = _scale_o_vec(o_accs_in, corr_scalar)
         return [p_elems, m_i_in, l_i_out, o_accs_out, corr]
 
+    def softmax_p_only(s_scaled, m_i_in):
+        """Phase A: P = exp2(S - m_new). No l_new, no O rescale."""
+        m_new = m_i_in[0]
+        return [_hw_exp2(s_scaled[i] - m_new) for i in range_constexpr(n_c)]
+
+    def softmax_l_update(p_elems, l_i_in, corr_scalar):
+        """Phase C: l_new = corr * l_old + sum(P)."""
+        p_vec = Vec.from_elements(p_elems, fx.Float32)
+        local_sum = p_vec.reduce("add", init_val=fx.Float32(0.0), fastmath=_FM)
+        local_sum = _permlane32_reduce(local_sum, "sum")
+        l_new = fx.Float32(fx.fma(l_i_in[0], corr_scalar, local_sum, fastmath=_FM))
+        return [l_new] + [l_i_in[r] for r in range_constexpr(1, npair)]
+
 
 # ── Register-only PV GEMM (V=A, P=B) ──────────────────────────────────
     # After QK swap (K=A, Q=B), C's M-rows = score indices.
@@ -1560,10 +1573,16 @@ def flex_attn_fwd_gfx950_kernel(
         # Full o_accs (all 4 chunks) in loop carry.
         _main_loop_count = _kv_range - fx.Int32(2)
 
+        # Loop carry: m_i + l_i + o_accs + prev_corr + prev_p_elems
+        _prev_corr_init = fx.Float32(1.0)
+        _prev_p_init = [fx.Float32(0.0) for _ in range_constexpr(n_c)]
+        _n_carry = npair + npair + _n_d_chunks + 1 + n_c
         init3 = (
             [m_i[r] for r in range_constexpr(npair)]
             + [l_i[r] for r in range_constexpr(npair)]
             + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+            + [_prev_corr_init]
+            + _prev_p_init
         )
         loop3_results = init3
 
@@ -1573,9 +1592,12 @@ def flex_attn_fwd_gfx950_kernel(
             fx.Int32(1),
             init=init3,
         ):
-            m_i = [loop_args[r] for r in range_constexpr(npair)]
-            l_i = [loop_args[npair + r] for r in range_constexpr(npair)]
-            o_accs = [loop_args[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+            _ci = 0
+            m_i = [loop_args[_ci + r] for r in range_constexpr(npair)]; _ci += npair
+            l_i = [loop_args[_ci + r] for r in range_constexpr(npair)]; _ci += npair
+            o_accs = [loop_args[_ci + dc] for dc in range_constexpr(_n_d_chunks)]; _ci += _n_d_chunks
+            prev_corr = loop_args[_ci]; _ci += 1
+            prev_p = [loop_args[_ci + e] for e in range_constexpr(n_c)]
 
             tile_idx = _kv_lo + fx.Int32(arith.index_cast(T.i32, kv_mid)) + fx.Int32(1)
 
@@ -1583,7 +1605,8 @@ def flex_attn_fwd_gfx950_kernel(
             read_k_all(slot=0)
             dualwave_cluster_sync(0)
 
-            # C1: wait K + QK GEMM (pure register) + softmax_start  [GEMM]
+            # C1: O rescale(prev_corr, overlaps QK GEMM) + QK GEMM + softmax_start
+            o_accs = _scale_o_vec(o_accs, prev_corr)
             rocdl.s_waitcnt(lgkmcnt=0)
             (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
@@ -1593,10 +1616,10 @@ def flex_attn_fwd_gfx950_kernel(
             m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
             dualwave_cluster_sync(1)
 
-            # C2: softmax_finish + K DMA(next) + V DMA
+            # C2: P = exp2 + P pack + K DMA + V DMA
             load_k(tile_idx + fx.Int32(1), 0)
             load_v(tile_idx, 0)
-            out_sm = softmax_finish(s_scaled, m_i, l_i, o_accs, corr)
+            p_elems = softmax_p_only(s_scaled, m_i)
             dualwave_cluster_sync(2)
 
             # C3: V DMA barrier + V read  [V-LDS, 3 from C0]
@@ -1607,26 +1630,32 @@ def flex_attn_fwd_gfx950_kernel(
             rocdl.s_waitcnt(lgkmcnt=0)
             dualwave_cluster_sync(3)
 
-            # C4: PV GEMM  [GEMM]
-            pv_gemm_register(out_sm[0], v_lo, v_hi, out_sm[3])
-            l_i, o_accs = out_sm[2], out_sm[3]
+            # C4: PV GEMM (uses prev_p from loop carry for O, current p_elems for accum)
+            pv_gemm_register(p_elems, v_lo, v_hi, o_accs)
             dualwave_cluster_sync(4)
 
-            # C5: K DMA barrier
+            # C5: K DMA barrier + l_new computation (uses empty cluster)
             _waitcnt_vm_n(int(_dma_ops_per_thread))
             rocdl.s_waitcnt(0)
             rocdl.s_barrier()
+            l_i = softmax_l_update(p_elems, l_i, corr)
             dualwave_cluster_sync(5)
 
             loop3_results = yield (
                 [m_i[r] for r in range_constexpr(npair)]
                 + [l_i[r] for r in range_constexpr(npair)]
                 + [o_accs[dc] for dc in range_constexpr(_n_d_chunks)]
+                + [corr]
+                + [p_elems[e] for e in range_constexpr(n_c)]
             )
 
-        m_i = [loop3_results[r] for r in range_constexpr(npair)]
-        l_i = [loop3_results[npair + r] for r in range_constexpr(npair)]
-        o_accs = [loop3_results[_o + dc] for dc in range_constexpr(_n_d_chunks)]
+        _ci = 0
+        m_i = [loop3_results[_ci + r] for r in range_constexpr(npair)]; _ci += npair
+        l_i = [loop3_results[_ci + r] for r in range_constexpr(npair)]; _ci += npair
+        o_accs = [loop3_results[_ci + dc] for dc in range_constexpr(_n_d_chunks)]; _ci += _n_d_chunks
+        _final_corr = loop3_results[_ci]
+        # Apply the last deferred O rescale before epilogue
+        o_accs = _scale_o_vec(o_accs, _final_corr)
 
         # ── Epilogue: last tile (0 or 1 times) ──
         _epilogue_count = (_kv_range > fx.Int32(1)).select(fx.Int32(1), fx.Int32(0))
