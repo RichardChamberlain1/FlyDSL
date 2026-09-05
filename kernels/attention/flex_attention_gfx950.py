@@ -1515,12 +1515,13 @@ def flex_attn_fwd_gfx950_kernel(
             rocdl.sched_barrier(0)
             _stagger_extra_barriers_open(infra.stagger_i32)
 
-        # C0: V DMA
-        load_v(_kv_lo, 0)
+        # C0: K read from LDS (K[0] barrier'd above)  [K-LDS]
+        read_k_all(slot=0)
         dualwave_cluster_sync(0)
 
-        # C1: QK GEMM + softmax_start  [GEMM]
-        (frag_S_pro,) = gemm1_qk_k_from_lds(frag_Q, slot=0)
+        # C1: wait K + QK GEMM (pure register) + softmax_start  [GEMM]
+        rocdl.s_waitcnt(lgkmcnt=0)
+        (frag_S_pro,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
         s_raw_pro = [frag_S_pro[i] for i in range_constexpr(n_c)]
         if const_expr(mod_has_score or mod_has_mask):
             apply_mods(s_raw_pro, _kv_lo)
@@ -1528,22 +1529,23 @@ def flex_attn_fwd_gfx950_kernel(
         m_i = [m_new_pro] + [m_i[r] for r in range_constexpr(1, npair)]
         dualwave_cluster_sync(1)
 
-        # C2: softmax_finish + K DMA + V barrier
+        # C2: softmax_finish + K DMA(tile 1) + V DMA(tile 0)
         _has_tile1 = (_kv_lo + fx.Int32(1)) < _kv_hi
         if _has_tile1:
             load_k(_kv_lo + fx.Int32(1), 0)
+        load_v(_kv_lo, 0)
         out_sm_pro = softmax_finish(s_scaled_pro, m_i, l_i, o_accs, corr_pro)
-        _waitcnt_vm_n(int(_dma_ops_per_thread))
-        rocdl.s_waitcnt(0)
-        rocdl.s_barrier()
         dualwave_cluster_sync(2)
 
-        # C3: V read
+        # C3: V DMA barrier + V read  [V-LDS, 3 from C0]
+        _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+        rocdl.s_waitcnt(0)
+        rocdl.s_barrier()
         v_lo_pro, v_hi_pro = read_v_slot[0]()
         rocdl.s_waitcnt(lgkmcnt=0)
         dualwave_cluster_sync(3)
 
-        # C4: PV GEMM  [GEMM, 3 from C1]
+        # C4: PV GEMM  [GEMM]
         pv_gemm_register(out_sm_pro[0], v_lo_pro, v_hi_pro, out_sm_pro[3])
         l_i, o_accs = out_sm_pro[2], out_sm_pro[3]
         dualwave_cluster_sync(4)
@@ -1577,12 +1579,13 @@ def flex_attn_fwd_gfx950_kernel(
 
             tile_idx = _kv_lo + fx.Int32(arith.index_cast(T.i32, kv_mid)) + fx.Int32(1)
 
-            # C0: V DMA
-            load_v(tile_idx, 0)
+            # C0: K read from LDS (K barrier'd in prev C5)  [K-LDS]
+            read_k_all(slot=0)
             dualwave_cluster_sync(0)
 
-            # C1: QK GEMM + softmax_start  [GEMM]
-            (frag_S,) = gemm1_qk_k_from_lds(frag_Q, slot=0)
+            # C1: wait K + QK GEMM (pure register) + softmax_start  [GEMM]
+            rocdl.s_waitcnt(lgkmcnt=0)
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
                 apply_mods(s_raw, tile_idx)
@@ -1590,20 +1593,21 @@ def flex_attn_fwd_gfx950_kernel(
             m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
             dualwave_cluster_sync(1)
 
-            # C2: softmax_finish + K DMA + V barrier
+            # C2: softmax_finish + K DMA(next) + V DMA
             load_k(tile_idx + fx.Int32(1), 0)
+            load_v(tile_idx, 0)
             out_sm = softmax_finish(s_scaled, m_i, l_i, o_accs, corr)
-            _waitcnt_vm_n(int(_dma_ops_per_thread))
-            rocdl.s_waitcnt(0)
-            rocdl.s_barrier()
             dualwave_cluster_sync(2)
 
-            # C3: V read
+            # C3: V DMA barrier + V read  [V-LDS, 3 from C0]
+            _waitcnt_vm_n(int(_dma_ops_per_thread) * 2)
+            rocdl.s_waitcnt(0)
+            rocdl.s_barrier()
             v_lo, v_hi = read_v_slot[0]()
             rocdl.s_waitcnt(lgkmcnt=0)
             dualwave_cluster_sync(3)
 
-            # C4: PV GEMM  [GEMM, 3 from C1]
+            # C4: PV GEMM  [GEMM]
             pv_gemm_register(out_sm[0], v_lo, v_hi, out_sm[3])
             l_i, o_accs = out_sm[2], out_sm[3]
             dualwave_cluster_sync(4)
@@ -1645,15 +1649,13 @@ def flex_attn_fwd_gfx950_kernel(
 
             _last_tile = _kv_hi - fx.Int32(1)
 
-            # C0: V DMA + V barrier (last tile, K already in LDS)
-            load_v(_last_tile, 0)
-            _waitcnt_vm_n(int(_dma_ops_per_thread))
-            rocdl.s_waitcnt(0)
-            rocdl.s_barrier()
+            # C0: K read from LDS (K barrier'd in prev C5)  [K-LDS]
+            read_k_all(slot=0)
             dualwave_cluster_sync(0)
 
-            # C1: QK GEMM + softmax_start  [GEMM]
-            (frag_S,) = gemm1_qk_k_from_lds(frag_Q, slot=0)
+            # C1: wait K + QK GEMM (pure register) + softmax_start  [GEMM]
+            rocdl.s_waitcnt(lgkmcnt=0)
+            (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
                 apply_mods(s_raw, _last_tile)
@@ -1661,11 +1663,15 @@ def flex_attn_fwd_gfx950_kernel(
             m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
             dualwave_cluster_sync(1)
 
-            # C2: softmax_finish
+            # C2: softmax_finish + V DMA(last tile)
+            load_v(_last_tile, 0)
             out_sm = softmax_finish(s_scaled, m_i, l_i, o_accs, corr)
             dualwave_cluster_sync(2)
 
-            # C3: V read
+            # C3: V DMA barrier + V read  [V-LDS, 3 from C0]
+            _waitcnt_vm_n(int(_dma_ops_per_thread))
+            rocdl.s_waitcnt(0)
+            rocdl.s_barrier()
             v_lo, v_hi = read_v_slot[0]()
             rocdl.s_waitcnt(lgkmcnt=0)
             dualwave_cluster_sync(3)
