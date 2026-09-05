@@ -1324,6 +1324,25 @@ def flex_attn_fwd_gfx950_kernel(
         corr_scalar = _hw_exp2(m_i_in[0] - m_new)
         return corr_scalar, s_out, m_new
 
+    def softmax_scale(frag_S_in):
+        """Scale S and apply mods. Returns s_out (no max/corr yet)."""
+        s_elems = [frag_S_in[i] for i in range_constexpr(n_c)]
+        if const_expr(not _prescaled_q):
+            _sl2e_vec = Vec.from_elements([scale_log2e], fx.Float32).broadcast_to(16)
+            s_scaled = Vec.from_elements(s_elems, fx.Float32) * _sl2e_vec
+            return [s_scaled[i] for i in range_constexpr(n_c)]
+        return s_elems
+
+    def softmax_max_corr(s_out, m_i_in):
+        """Max reduction + permlane + corr. Run in a separate cluster."""
+        tile_max = s_out[0]
+        for i in range_constexpr(1, n_c):
+            tile_max = tile_max.maximumf(s_out[i])
+        tile_max = _permlane32_reduce(tile_max, "max")
+        m_new = m_i_in[0].maximumf(tile_max)
+        corr_scalar = _hw_exp2(m_i_in[0] - m_new)
+        return corr_scalar, s_out, m_new
+
     def softmax_finish(s_scaled, m_i_in, l_i_in, o_accs_in, corr_scalar):
         m_new = m_i_in[0]
         p_elems = [_hw_exp2(s_scaled[i] - m_new) for i in range_constexpr(n_c)]
@@ -1603,17 +1622,18 @@ def flex_attn_fwd_gfx950_kernel(
             read_k_all(slot=1)
             dualwave_cluster_sync(0)
 
-            # C1: O rescale + QK GEMM + softmax_start  [GEMM]
+            # C1: O rescale + QK GEMM + softmax_scale  [GEMM]
             o_accs = _scale_o_vec(o_accs, prev_corr)
             (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[1])
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
                 apply_mods(s_raw, tile_even)
-            corr, s_scaled, m_new = softmax_start(s_raw, m_i)
-            m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            s_scaled = softmax_scale(frag_S)
             dualwave_cluster_sync(1)
 
-            # C2: P exp2 + K[odd] DMA → slot 0 + V[odd] DMA → slot 0
+            # C2: softmax_max_corr + P exp2 + K DMA + V DMA
+            corr, s_scaled, m_new = softmax_max_corr(s_scaled, m_i)
+            m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
             load_k(tile_even + fx.Int32(1), 0)
             load_v(tile_even + fx.Int32(1), 0)
             p_elems = softmax_p_only(s_scaled, m_i)
@@ -1639,17 +1659,18 @@ def flex_attn_fwd_gfx950_kernel(
             read_k_all(slot=0)
             dualwave_cluster_sync(0)
 
-            # C1: O rescale + QK GEMM + softmax_start  [GEMM]
+            # C1: O rescale + QK GEMM + softmax_scale  [GEMM]
             o_accs = _scale_o_vec(o_accs, corr)
             (frag_S,) = gemm1_qk_unrolled(frag_Q, frag_K[0])
             s_raw = [frag_S[i] for i in range_constexpr(n_c)]
             if const_expr(mod_has_score or mod_has_mask):
                 apply_mods(s_raw, tile_odd)
-            corr, s_scaled, m_new = softmax_start(s_raw, m_i)
-            m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
+            s_scaled = softmax_scale(frag_S)
             dualwave_cluster_sync(1)
 
-            # C2: P exp2 + K[next_even] DMA → slot 1 + V[next_even] DMA → slot 1
+            # C2: softmax_max_corr + P exp2 + K DMA + V DMA
+            corr, s_scaled, m_new = softmax_max_corr(s_scaled, m_i)
+            m_i = [m_new] + [m_i[r] for r in range_constexpr(1, npair)]
             load_k(tile_odd + fx.Int32(1), 1)
             load_v(tile_odd + fx.Int32(1), 1)
             p_elems = softmax_p_only(s_scaled, m_i)
