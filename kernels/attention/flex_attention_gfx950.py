@@ -1545,16 +1545,12 @@ def flex_attn_fwd_gfx950_kernel(
         rocdl.s_waitcnt(lgkmcnt=0)
         dualwave_cluster_sync(3)
 
-        # C4: PV GEMM  [GEMM]
+        # C4: PV GEMM + K DMA wait  [GEMM]
         pv_gemm_register(out_sm_pro[0], v_lo_pro, v_hi_pro, out_sm_pro[3])
         l_i, o_accs = out_sm_pro[2], out_sm_pro[3]
-        dualwave_cluster_sync(4)
-
-        # C5: K DMA barrier
         _waitcnt_vm_n(int(_dma_ops_per_thread))
         rocdl.s_waitcnt(0)
-        rocdl.s_barrier()
-        dualwave_cluster_sync(5)
+        dualwave_cluster_sync(4)  # K DMA barrier (merged)
 
         # ── Main loop: tiles 1 .. N-2 ──
         # Full o_accs (all 4 chunks) in loop carry.
@@ -1607,16 +1603,12 @@ def flex_attn_fwd_gfx950_kernel(
             rocdl.s_waitcnt(lgkmcnt=0)
             dualwave_cluster_sync(3)
 
-            # C4: PV GEMM  [GEMM]
+            # C4: PV GEMM + K DMA wait  [GEMM]
             pv_gemm_register(out_sm[0], v_lo, v_hi, out_sm[3])
             l_i, o_accs = out_sm[2], out_sm[3]
-            dualwave_cluster_sync(4)
-
-            # C5: K DMA barrier
             _waitcnt_vm_n(int(_dma_ops_per_thread))
             rocdl.s_waitcnt(0)
-            rocdl.s_barrier()
-            dualwave_cluster_sync(5)
+            dualwave_cluster_sync(4)  # K DMA barrier (merged)
 
             loop3_results = yield (
                 [m_i[r] for r in range_constexpr(npair)]
@@ -1676,13 +1668,10 @@ def flex_attn_fwd_gfx950_kernel(
             rocdl.s_waitcnt(lgkmcnt=0)
             dualwave_cluster_sync(3)
 
-            # C4: PV GEMM  [GEMM, 3 from C1]
+            # C4: PV GEMM  [GEMM]
             pv_gemm_register(out_sm[0], v_lo, v_hi, out_sm[3])
             l_i, o_accs = out_sm[2], out_sm[3]
             dualwave_cluster_sync(4)
-
-            # C5: sync
-            dualwave_cluster_sync(5)
 
             epi3_results = yield (
                 [m_i[r] for r in range_constexpr(npair)]
