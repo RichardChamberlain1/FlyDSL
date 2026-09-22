@@ -2834,6 +2834,25 @@ _flex_attn_compile_hints = {
 launch_flex_attn_gfx950.compile_hints = dict(_flex_attn_compile_hints)
 
 
+_FLEX_DENSE_PARAM_CACHE: dict = {}
+_FLEX_DENSE_SCRATCH_CACHE: dict = {}
+
+
+def _flex_dense_scratch(device):
+    """Per-device reusable placeholder scratch (never read on the dense path)."""
+    scratch = _FLEX_DENSE_SCRATCH_CACHE.get(device)
+    if scratch is None:
+        scratch = (
+            torch.empty(1, dtype=torch.int32, device=device),  # kv_bounds
+            torch.empty(1, dtype=torch.float32, device=device),  # ws_o
+            torch.empty(1, dtype=torch.float32, device=device),  # ws_ml
+            torch.empty(1, dtype=torch.int32, device=device),  # block_table
+            torch.empty(1, dtype=torch.int32, device=device),  # context_lens
+        )
+        _FLEX_DENSE_SCRATCH_CACHE[device] = scratch
+    return scratch
+
+
 def flydsl_flex_attention_layout(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2858,6 +2877,8 @@ def flydsl_flex_attention_layout(
     """Flex-attention forward on the layout API (gfx950) with score/mask mods.
 
     q/k/v: ``[B, S, H, D]`` (BSHD), bf16/f16. Returns ``[B, Sq, Hq, D]``.
+    Use ``kernels.attention.flex_attention`` for PyTorch-compatible BHSD inputs
+    and automatic fallback on unsupported configurations.
 
     ``score_mod`` remains the source of truth. By default, a callable exactly
     matching ``score + slope * (kv_idx - q_idx)`` may be represented inside
@@ -2896,6 +2917,89 @@ def flydsl_flex_attention_layout(
         raise ValueError(f"seqlen_q ({Sq}) must be a multiple of block_m*num_groups ({rows_per_wg})")
     if scale is None:
         scale = 1.0 / (D**0.5)
+    if (
+        score_mod is None
+        and mask_mod is None
+        and int(num_kv_splits) == 1
+        and not (pipe_depth >= 2 and num_groups < 2)
+    ):
+        _key = (
+            dtype_id,
+            Sq,
+            Skv,
+            Hq,
+            Hkv,
+            block_m,
+            block_n,
+            D,
+            num_groups,
+            pipe_depth,
+            pipe_stages,
+            bool(accurate_softmax),
+            long_seq_8c,
+        )
+        _cached = _FLEX_DENSE_PARAM_CACHE.get(_key)
+        if _cached is None:
+            _flex_mod = inspect_flex_mods(
+                None,
+                None,
+                seqlen_q=Sq,
+                seqlen_kv=Skv,
+                num_batches=B,
+                num_heads=Hq,
+                infer_score_mod=infer_score_mod,
+            )
+            _param = make_flex_attn_param(
+                seqlen_kv=Skv,
+                dtype_id=dtype_id,
+                block_m=block_m,
+                block_n=block_n,
+                head_dim=D,
+                num_heads_q=Hq,
+                num_heads_kv=Hkv,
+                num_groups=num_groups,
+                pipe_depth=pipe_depth,
+                pipe_stages=pipe_stages,
+                accurate_softmax=accurate_softmax,
+                flex_mod=_flex_mod,
+                num_kv_splits=1,
+                long_seq_8c=long_seq_8c,
+                seqlen_q=Sq,
+                has_kv_bounds=False,
+            )
+            _cached = (_param, _flex_mod)
+            _FLEX_DENSE_PARAM_CACHE[_key] = _cached
+        _param, _flex_mod = _cached
+
+        _kv_bounds, _ws_o, _ws_ml, _dbt, _dctx = _flex_dense_scratch(q.device)
+        qc = q if q.is_contiguous() else q.contiguous()
+        kc = k if k.is_contiguous() else k.contiguous()
+        vc = v if v.is_contiguous() else v.contiguous()
+
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        if out is None:
+            out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        launch_flex_attn_gfx950(
+            out,
+            qc,
+            kc,
+            vc,
+            fx.Float32(scale),
+            _param,
+            _flex_mod.score_mod,
+            _flex_mod.mask_mod,
+            stream,
+            ws_o=_ws_o,
+            ws_ml=_ws_ml,
+            block_table=_dbt,
+            block_table_stride=fx.Int32(0),
+            context_lens=_dctx,
+            max_seqlen_kv=fx.Int32(Skv),
+            kv_bounds=_kv_bounds,
+        )
+        return out
+
     flex_mod = inspect_flex_mods(
         score_mod,
         mask_mod,
